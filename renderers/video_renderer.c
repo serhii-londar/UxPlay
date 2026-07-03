@@ -107,6 +107,7 @@ struct video_renderer_s {
     GstBus *bus;
     const char *codec;
     bool autovideo;
+    bool rtp_output;
     int id;
     char *uri;
     gboolean eos;
@@ -333,6 +334,7 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
         renderer_type[i]->appsrc = NULL;
         renderer_type[i]->textsrc = NULL;
         renderer_type[i]->uri = NULL;
+        renderer_type[i]->rtp_output = false;
         renderer_type[i]->eos = FALSE;
         if (hls_video) {
             renderer_type[i]->uri = (char *) calloc(strlen(uri) + 1, sizeof(char));
@@ -373,9 +375,11 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             bool jpeg_pipeline = false;
             if (i == type_264) {
                 renderer_type[i]->codec = h264;
+                renderer_type[i]->rtp_output = rtp;
                 caps = gst_caps_from_string(h264_caps);
             } else if (i == type_265) {
                 renderer_type[i]->codec = h265;
+                renderer_type[i]->rtp_output = rtp;
                 caps = gst_caps_from_string(h265_caps);
             } else if (i == type_jpeg) {
                 jpeg_pipeline = true;
@@ -948,11 +952,59 @@ void video_renderer_hls_ready() {
     }
 }
 
+static bool video_renderer_push_h264_end_markers(video_renderer_t *renderer) {
+    static const unsigned char h264_end_markers[] = {
+        0x00, 0x00, 0x00, 0x01, 0x0a, 0x80, /* end_of_seq_rbsp */
+        0x00, 0x00, 0x00, 0x01, 0x0b, 0x80  /* end_of_stream_rbsp */
+    };
+    GstBuffer *buffer = NULL;
+    GstFlowReturn flow_ret;
+
+    if (!renderer || !renderer->appsrc || !renderer->rtp_output || strcmp(renderer->codec, h264)) {
+        return false;
+    }
+
+    buffer = gst_buffer_new_allocate(NULL, sizeof(h264_end_markers), NULL);
+    if (!buffer) {
+        logger_log(logger, LOGGER_WARNING, "failed to allocate H.264 end marker buffer");
+        return false;
+    }
+    gst_buffer_fill(buffer, 0, h264_end_markers, sizeof(h264_end_markers));
+
+    flow_ret = gst_app_src_push_buffer(GST_APP_SRC(renderer->appsrc), buffer);
+    logger_log(logger, LOGGER_DEBUG, "pushed H.264 end_of_sequence/end_of_stream NALs to RTP pipeline: %s",
+               gst_flow_get_name(flow_ret));
+    return flow_ret == GST_FLOW_OK;
+}
+
+static void video_renderer_drain_eos(video_renderer_t *renderer) {
+    GstMessage *message = NULL;
+
+    if (!renderer || !renderer->bus) {
+        return;
+    }
+
+    message = gst_bus_timed_pop_filtered(renderer->bus, 200 * GST_MSECOND,
+                                         (GstMessageType) (GST_MESSAGE_EOS | GST_MESSAGE_ERROR));
+    if (message) {
+        logger_log(logger, LOGGER_DEBUG, "video renderer drain observed %s before shutdown",
+                   GST_MESSAGE_TYPE_NAME(message));
+        gst_message_unref(message);
+    } else {
+        logger_log(logger, LOGGER_DEBUG, "video renderer drain timed out before shutdown");
+    }
+}
+
 void video_renderer_stop() {
     if (renderer) {
+        bool pushed_h264_end_markers = false;
         logger_log(logger, LOGGER_DEBUG,"video_renderer_stop");
         if (renderer->appsrc) {
+            pushed_h264_end_markers = video_renderer_push_h264_end_markers(renderer);
             gst_app_src_end_of_stream (GST_APP_SRC(renderer->appsrc));
+        }
+        if (pushed_h264_end_markers) {
+            video_renderer_drain_eos(renderer);
         }
         gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
         //gst_element_set_state (renderer->playbin, GST_STATE_NULL);
