@@ -1007,6 +1007,8 @@ void video_renderer_stop() {
             video_renderer_drain_eos(renderer);
         }
         gst_element_set_state (renderer->pipeline, GST_STATE_NULL);
+        renderer = NULL;
+        first_packet = true;
         //gst_element_set_state (renderer->playbin, GST_STATE_NULL);
      }
 }
