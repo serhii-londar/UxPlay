@@ -333,7 +333,7 @@ raop_rtp_process_events(raop_rtp_t *raop_rtp, void *cb_data)
     /* Handle flush if requested */
     if (flush != NO_FLUSH) {
         if (raop_rtp->callbacks.audio_flush) {
-            raop_rtp->callbacks.audio_flush(raop_rtp->callbacks.cls);
+            raop_rtp->callbacks.audio_flush(raop_rtp->callbacks.cls, raop_rtp->ntp);
         }
     }
 

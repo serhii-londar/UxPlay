@@ -34,6 +34,16 @@ extern "C" {
 
 bool gstreamer_init();
 void audio_renderer_init(logger_t *logger, const char* audiosink, const bool *audio_sync, const bool *video_sync, const char *artp_pipeline);
+/* multi-client mode never calls audio_renderer_init(); this just sets the module's
+ * logger so any callback that still logs through it (e.g. before it's fully gated)
+ * doesn't crash on a NULL logger. See video_renderer_multi_client_init(). */
+void audio_renderer_multi_client_init(logger_t *logger);
+/* Per-slot equivalent of audio_renderer_start/render_buffer/stop -- one decode+re-encode
+ * pipeline per concurrently connected client, keyed by slot instead of the single shared
+ * `renderer`. See video_renderer_multi_client_* for the video equivalent. */
+int audio_renderer_multi_client_start(int slot, unsigned char ct, const char *rtp_pipeline_template, unsigned short port);
+void audio_renderer_multi_client_push(int slot, unsigned char *data, int data_len, uint64_t ntp_time);
+void audio_renderer_multi_client_stop(int slot);
 void audio_renderer_start(unsigned char* compression_type);
 void audio_renderer_stop();
 void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned short *seqnum, uint64_t *ntp_time);

@@ -95,13 +95,17 @@ raop_handler_info(raop_conn_t *conn,
     
     if (add_txt_airplay) {
         const char *txt = dnssd_get_airplay_txt(raop->dnssd, &len);
-        plist_t txt_airplay_node = plist_new_data(txt, len);
+        /* conn_init() unregisters (and frees) the dnssd TXT records as soon as
+           the first connection opens, which can race with that same
+           connection's own GET /info still reading them here. Guard against
+           the freed/NULL record instead of segfaulting on plist_new_data. */
+        plist_t txt_airplay_node = plist_new_data(txt ? txt : "", txt ? len : 0);
         plist_dict_set_item(res_node, txtAirPlay, txt_airplay_node);
     }
 
     if (add_txt_raop) {
         const char *txt = dnssd_get_raop_txt(raop->dnssd, &len);
-        plist_t txt_raop_node = plist_new_data(txt, len);
+        plist_t txt_raop_node = plist_new_data(txt ? txt : "", txt ? len : 0);
         plist_dict_set_item(res_node, txtRAOP, txt_raop_node);
     }
   
@@ -897,7 +901,11 @@ raop_handler_setup(raop_conn_t *conn,
             logger_log(raop->logger, LOGGER_ERR, "Client did not supply timing_rport,"
                        " may be using unsupported AirPlay2 \"Remote Control\" protocol");
         }
-        unsigned short timing_lport = raop->timing_lport;
+        /* multi-client mode: the fixed configured port only ever admits one bound socket --
+         * every concurrent connection past the first would silently fail to bind it (logged,
+         * not surfaced) and be told SETUP succeeded anyway. Request an OS-assigned ephemeral
+         * port per connection instead, same as the per-slot video loopback ports already do. */
+        unsigned short timing_lport = (raop->multi_client_max > 0) ? 0 : raop->timing_lport;
 
         conn->raop_ntp = NULL;
         conn->raop_rtp = NULL;
@@ -947,7 +955,8 @@ raop_handler_setup(raop_conn_t *conn,
             case 110: {
                 // Mirroring
                 raop_destroy_airplay_video(raop, -1);  //cleanup any hls data still present when mirror video starts
-                unsigned short dport = raop->mirror_data_lport;
+                /* see the matching timing_lport comment above -- same fixed-port collision */
+                unsigned short dport = (raop->multi_client_max > 0) ? 0 : raop->mirror_data_lport;
                 plist_t stream_id_node = plist_dict_get_item(req_stream_node, "streamConnectionID");
                 uint64_t stream_connection_id = 0;
                 plist_get_uint_val(stream_id_node, &stream_connection_id);
@@ -974,7 +983,9 @@ raop_handler_setup(raop_conn_t *conn,
                 }
             case 96: {
                 // Audio
-                unsigned short cport = raop->control_lport, dport = raop->data_lport; 
+                /* see the timing_lport comment above -- same fixed-port collision applies to audio */
+                unsigned short cport = (raop->multi_client_max > 0) ? 0 : raop->control_lport;
+                unsigned short dport = (raop->multi_client_max > 0) ? 0 : raop->data_lport;
                 unsigned short remote_cport = 0;
                 unsigned char ct = 0;
                 unsigned int sr = AUDIO_SAMPLE_RATE; /* all AirPlay audio formats supported so far have sample rate 44.1kHz */
@@ -1019,7 +1030,7 @@ raop_handler_setup(raop_conn_t *conn,
                         usingScreen = false;
                     }
 
-                    raop->callbacks.audio_get_format(raop->callbacks.cls, &ct, &spf, &usingScreen, &isMedia, &audioFormat);
+                    raop->callbacks.audio_get_format(raop->callbacks.cls, conn->raop_ntp, &ct, &spf, &usingScreen, &isMedia, &audioFormat);
                 }
 
                 if (conn->raop_rtp) {
@@ -1194,7 +1205,7 @@ raop_handler_feedback(raop_conn_t *conn,
     raop_t *raop = conn->raop;
     logger_log(raop->logger, LOGGER_DEBUG, "raop_handler_feedback");
     /* register receipt of client's "heartbeat" signal  */
-    raop->callbacks.conn_feedback(raop->callbacks.cls);
+    raop->callbacks.conn_feedback(raop->callbacks.cls, conn->raop_ntp);
 }
 
 static void
@@ -1265,9 +1276,15 @@ raop_handler_teardown(raop_conn_t *conn,
     }
     plist_free(req_root_node);
     logger_log(raop->logger, LOGGER_DEBUG, "TEARDOWN request,  96=%d, 110=%d", teardown_96, teardown_110);
-  
-    http_response_add_header(response, "Connection", "close");
-  
+
+    /* Connection: close tells the client this RTSP control connection is going away --
+     * only true for the full teardown (neither flag set). A partial teardown (96 or 110
+     * alone) means "pause just this sub-stream, session stays up"; claiming the connection
+     * is closing there is wrong and gives the client a reason to distrust it's still live. */
+    if (!teardown_96 && !teardown_110) {
+        http_response_add_header(response, "Connection", "close");
+    }
+
     if (teardown_96) {
         if (conn->raop_rtp) {
             /* Stop our audio RTP session */
@@ -1277,11 +1294,14 @@ raop_handler_teardown(raop_conn_t *conn,
                 raop->callbacks.audio_stop_coverart_rendering(raop->callbacks.cls);
             }
         }
+        if (raop->callbacks.audio_reset) {
+            raop->callbacks.audio_reset(raop->callbacks.cls, conn->raop_ntp);
+        }
     } else if (teardown_110) {
         if (raop->hls_pending) {
-            raop->callbacks.video_reset(raop->callbacks.cls, RESET_TYPE_RTP_TO_HLS_TEARDOWN);
+            raop->callbacks.video_reset(raop->callbacks.cls, conn->raop_ntp, RESET_TYPE_RTP_TO_HLS_TEARDOWN);
         } else {
-            raop->callbacks.video_reset(raop->callbacks.cls, RESET_TYPE_RTP_SHUTDOWN);
+            raop->callbacks.video_reset(raop->callbacks.cls, conn->raop_ntp, RESET_TYPE_RTP_SHUTDOWN);
         }
         if (conn->raop_rtp_mirror) {
         /* Stop our video RTP session */
@@ -1300,7 +1320,7 @@ raop_handler_teardown(raop_conn_t *conn,
         /* shut down any HLS connections */
         int hls_count = httpd_count_connection_type(raop->httpd, CONNECTION_TYPE_HLS);
         if (hls_count) {
-            raop->callbacks.video_reset(raop->callbacks.cls, RESET_TYPE_HLS_SHUTDOWN);
+            raop->callbacks.video_reset(raop->callbacks.cls, conn->raop_ntp, RESET_TYPE_HLS_SHUTDOWN);
         }
     }
 }

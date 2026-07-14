@@ -60,7 +60,11 @@ struct raop_s {
     unsigned short timing_lport;
     unsigned short control_lport;
     unsigned short data_lport;
-    unsigned short mirror_data_lport;  
+    unsigned short mirror_data_lport;
+
+    /* 0 (default): legacy single-client gate (reject or nohold-preempt a 2nd RAOP connection).
+     * >0: admit up to this many concurrent RAOP connections side by side. See raop_set_multiclient(). */
+    int multi_client_max;
 
     /* configurable plist items: width, height, refreshRate, maxFPS, overscanned *
      * also clientFPSdata, which controls whether video stream info received     *
@@ -269,14 +273,29 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
 
     if (conn->connection_type == CONNECTION_TYPE_UNKNOWN) {
         if (cseq || ble) {
-            if (httpd_count_connection_type(raop->httpd, CONNECTION_TYPE_RAOP)) {
+            int existing_raop_conns = httpd_count_connection_type(raop->httpd, CONNECTION_TYPE_RAOP);
+            if (raop->multi_client_max > 0) {
+                /* multi-client mode: admit concurrent RAOP connections side by side (no preempt,
+                 * no reject) up to the configured pool size instead of the legacy one-at-a-time gate. */
+                if (existing_raop_conns >= raop->multi_client_max) {
+                    char ipaddr[40] = { '\0' };
+                    utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id, ipaddr, (int) (sizeof(ipaddr)));
+                    logger_log(raop->logger, LOGGER_WARNING, "multi-client pool full (%d/%d): rejecting new connection request from %s",
+                               existing_raop_conns, raop->multi_client_max, ipaddr);
+                    *response = http_response_create();
+                    http_response_init(*response, protocol, 409, "Conflict: Server is at maximum concurrent client capacity");
+                    goto finish;
+                }
+            } else if (existing_raop_conns) {
                 char ipaddr[40] = { '\0' };
                 utils_ipaddress_to_string(conn->remotelen, conn->remote, conn->zone_id, ipaddr, (int) (sizeof(ipaddr)));
                 if (httpd_nohold(raop->httpd)) {
-                    logger_log(raop->logger, LOGGER_INFO, "*****\"nohold\" feature: switch to new connection request from %s", ipaddr);		  
+                    logger_log(raop->logger, LOGGER_INFO, "*****\"nohold\" feature: switch to new connection request from %s", ipaddr);
                     httpd_remove_known_connections(raop->httpd);
                     if (raop->callbacks.video_reset) {
-                        raop->callbacks.video_reset(raop->callbacks.cls, RESET_TYPE_NOHOLD);
+                        /* broadcast reset: httpd_remove_known_connections() above already tore down
+                         * every existing conn, so there's no single conn to attribute this to. */
+                        raop->callbacks.video_reset(raop->callbacks.cls, NULL, RESET_TYPE_NOHOLD);
                     }
                 } else {
                     logger_log(raop->logger, LOGGER_WARNING, "rejecting new connection request from %s", ipaddr);
@@ -550,7 +569,7 @@ conn_destroy(void *ptr) {
     logger_log(raop->logger, LOGGER_DEBUG, "Destroying connection");
 
     if (raop->callbacks.conn_destroy) {
-        raop->callbacks.conn_destroy(raop->callbacks.cls);
+        raop->callbacks.conn_destroy(raop->callbacks.cls, conn->raop_ntp);
     }
 
     if (conn->raop_rtp) {
@@ -561,12 +580,15 @@ conn_destroy(void *ptr) {
         /* This is done in case TEARDOWN was not called */
         raop_rtp_mirror_destroy(conn->raop_rtp_mirror);
     }
-    if (conn->raop_ntp) {
-        raop_ntp_destroy(conn->raop_ntp);
-    }
 
     if (raop->callbacks.video_flush) {
-        raop->callbacks.video_flush(raop->callbacks.cls);
+        /* ntp is destroyed right after this call; callbacks must treat the pointer as an
+         * opaque per-connection key (e.g. a map lookup), not dereference or retain it. */
+        raop->callbacks.video_flush(raop->callbacks.cls, conn->raop_ntp);
+    }
+
+    if (conn->raop_ntp) {
+        raop_ntp_destroy(conn->raop_ntp);
     }
 
     free(conn->local);
@@ -779,6 +801,12 @@ raop_set_port(raop_t *raop, unsigned short port) {
 }
 
 void
+raop_set_multiclient(raop_t *raop, int max_clients) {
+    assert(raop);
+    raop->multi_client_max = max_clients;
+}
+
+void
 raop_set_udp_ports(raop_t *raop, unsigned short udp[3]) {
     assert(raop);
     raop->timing_lport = udp[0]; 
@@ -881,7 +909,8 @@ void raop_handle_eos(raop_t *raop) {
     raop_destroy_airplay_video(raop, id);
     raop->current_video = -1;
     /* reset video without deleting raop->airplay_video */
-    raop->callbacks.video_reset(raop->callbacks.cls, RESET_TYPE_HLS_EOS);
+    /* HLS playlist state is process-wide, not tied to one conn, so there's no ntp to pass. */
+    raop->callbacks.video_reset(raop->callbacks.cls, NULL, RESET_TYPE_HLS_EOS);
 }
 
 uint64_t get_local_time() {

@@ -74,6 +74,17 @@ bool video_get_playback_info(double *duration, double *position, double *seek_st
 int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265);
 unsigned int video_renderer_listen(void *loop, int id);
 bool video_renderer_eos_watch();
+
+/* Multi-client mirroring: each "slot" is an independent appsrc-fed H264 pipeline
+ * built from the same -vrtp template as the singleton path above, bound to its
+ * own loopback port. Slots don't touch the singleton `renderer` state at all,
+ * so this can run alongside (or instead of) the normal single-client renderer. */
+#define VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS 12
+void video_renderer_multi_client_init(logger_t *render_logger);
+int video_renderer_multi_client_start(int slot, const char *parser, const char *rtp_pipeline_template,
+                                      unsigned short port, bool video_sync_enabled);
+void video_renderer_multi_client_push(int slot, unsigned char *data, int data_len, uint64_t ntp_time);
+void video_renderer_multi_client_stop(int slot);
 #ifdef __cplusplus
 }
 #endif

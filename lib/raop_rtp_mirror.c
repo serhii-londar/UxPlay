@@ -583,9 +583,9 @@ raop_rtp_mirror_thread(void *arg)
                 }
                 if (!video_stream_suspended && (packet[6] == 0x56 || packet[6] == 0x5e)) {
                     video_stream_suspended = true;
-                    raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
+                    raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp);
                 } else if (video_stream_suspended && (packet[6] == 0x16 || packet[6] == 0x1e)) {
-                    raop_rtp_mirror->callbacks.video_resume(raop_rtp_mirror->callbacks.cls);
+                    raop_rtp_mirror->callbacks.video_resume(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp);
                     video_stream_suspended = false;
                 }
 
@@ -608,7 +608,7 @@ raop_rtp_mirror_thread(void *arg)
                 }
                 logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror: unidentified extra header data  %f, %f", unknown_w, unknown_h);
                 if (raop_rtp_mirror->callbacks.video_report_size) {
-                    raop_rtp_mirror->callbacks.video_report_size(raop_rtp_mirror->callbacks.cls, &width_source, &height_source, &width, &height);
+                    raop_rtp_mirror->callbacks.video_report_size(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp, &width_source, &height_source, &width, &height);
                 }
                 logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror width_source = %f height_source = %f width = %f height = %f",
                            width_source, height_source, width, height);
@@ -632,7 +632,7 @@ raop_rtp_mirror_thread(void *arg)
                     if (codec == VIDEO_CODEC_UNKNOWN) {
                         codec = VIDEO_CODEC_H265;
                         h265_video = true;
-                        if (raop_rtp_mirror->callbacks.video_set_codec(raop_rtp_mirror->callbacks.cls, codec) < 0) {
+                        if (raop_rtp_mirror->callbacks.video_set_codec(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp, codec) < 0) {
                             logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "failed to set video codec as H265 ");
                             /* drop connection */
                             conn_reset = true;
@@ -652,7 +652,7 @@ raop_rtp_mirror_thread(void *arg)
  
                     if (memcmp(ptr, vps_start_code, 4)) {
                         logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "non-conforming HEVC VPS/SPS/PPS payload (VPS)");
-                        raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
+                        raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp);
                         break;
                     }
                     short vps_size = byteutils_get_short_be(ptr, 3);
@@ -666,7 +666,7 @@ raop_rtp_mirror_thread(void *arg)
                     ptr += vps_size;
                     if (memcmp(ptr, sps_start_code, 4)) {
                         logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "non-conforming HEVC VPS/SPS/PPS payload (SPS)");
-                        raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
+                        raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp);
                         break;
                     }
                     short sps_size = byteutils_get_short_be(ptr, 3);
@@ -680,7 +680,7 @@ raop_rtp_mirror_thread(void *arg)
                     ptr += sps_size;
                     if (memcmp(ptr, pps_start_code, 4)) {
                        logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "non-conforming HEVC VPS/SPS/PPS payload (PPS)");			
-                        raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls);
+                        raop_rtp_mirror->callbacks.video_pause(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp);
                         break;
                     }
                     short pps_size = byteutils_get_short_be(ptr, 3);
@@ -711,7 +711,7 @@ raop_rtp_mirror_thread(void *arg)
                     if (codec == VIDEO_CODEC_UNKNOWN) {
                         codec = VIDEO_CODEC_H264;
                         h265_video = false;
-                        if (raop_rtp_mirror->callbacks.video_set_codec(raop_rtp_mirror->callbacks.cls, codec) < 0) {
+                        if (raop_rtp_mirror->callbacks.video_set_codec(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp, codec) < 0) {
                             logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "failed to set video codec as H264 ");
                             /* drop connection */
                             conn_reset = true;
@@ -842,18 +842,18 @@ raop_rtp_mirror_thread(void *arg)
     raop_rtp_mirror->running = false;
     MUTEX_UNLOCK(raop_rtp_mirror->run_mutex);
     if (raop_rtp_mirror->callbacks.mirror_video_running) {
-        raop_rtp_mirror->callbacks.mirror_video_running(raop_rtp_mirror->callbacks.cls, false);
+        raop_rtp_mirror->callbacks.mirror_video_running(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp, false);
     }
 
     logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror exiting TCP thread");
     if (conn_reset&& raop_rtp_mirror->callbacks.conn_reset) {
-        raop_rtp_mirror->callbacks.conn_reset(raop_rtp_mirror->callbacks.cls, 1);
+        raop_rtp_mirror->callbacks.conn_reset(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp, 1);
     }
 
     if (unsupported_codec) {
         CLOSESOCKET(raop_rtp_mirror->mirror_data_sock);
         raop_rtp_mirror_stop(raop_rtp_mirror);
-        raop_rtp_mirror->callbacks.video_reset(raop_rtp_mirror->callbacks.cls, RESET_TYPE_RTP_SHUTDOWN);
+        raop_rtp_mirror->callbacks.video_reset(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp, RESET_TYPE_RTP_SHUTDOWN);
     }
 
     return 0;
@@ -923,7 +923,7 @@ raop_rtp_mirror_start(raop_rtp_mirror_t *raop_rtp_mirror, unsigned short *mirror
     raop_rtp_mirror->running = 1;
     raop_rtp_mirror->joined = 0;
     if (raop_rtp_mirror->callbacks.mirror_video_running) {
-        raop_rtp_mirror->callbacks.mirror_video_running(raop_rtp_mirror->callbacks.cls, true);
+        raop_rtp_mirror->callbacks.mirror_video_running(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp, true);
     }
 
     THREAD_CREATE(raop_rtp_mirror->thread_mirror, raop_rtp_mirror_thread, raop_rtp_mirror);

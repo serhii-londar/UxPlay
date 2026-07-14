@@ -73,19 +73,23 @@ struct raop_callbacks_s {
 
     void  (*audio_process)(void *cls, raop_ntp_t *ntp, audio_decode_struct *data);
     void  (*video_process)(void *cls, raop_ntp_t *ntp, video_decode_struct *data);
-    void  (*video_pause)(void *cls);
-    void  (*video_resume)(void *cls);
-    void  (*conn_feedback) (void *cls);
-    void  (*conn_reset) (void *cls, int reason);
-    void  (*video_reset) (void *cls, reset_type_t reset_type);
-  
-  
+    void  (*video_pause)(void *cls, raop_ntp_t *ntp);
+    void  (*video_resume)(void *cls, raop_ntp_t *ntp);
+    void  (*conn_feedback) (void *cls, raop_ntp_t *ntp);
+    void  (*conn_reset) (void *cls, raop_ntp_t *ntp, int reason);
+    void  (*video_reset) (void *cls, raop_ntp_t *ntp, reset_type_t reset_type);
+    /* Mirrors video_reset, but for a client-initiated partial TEARDOWN of just the audio
+     * sub-stream (stream type 96) -- see raop_handler_teardown(). Multi-client mode uses
+     * this to release that connection's per-slot audio pipeline. */
+    void  (*audio_reset) (void *cls, raop_ntp_t *ntp);
+
+
     /* Optional but recommended callback functions (probably not optional, check this)*/
     void  (*conn_init)(void *cls);
-    void  (*conn_destroy)(void *cls);
+    void  (*conn_destroy)(void *cls, raop_ntp_t *ntp);
     void  (*conn_teardown)(void *cls, bool *teardown_96, bool *teardown_110 );
-    void  (*audio_flush)(void *cls);
-    void  (*video_flush)(void *cls);
+    void  (*audio_flush)(void *cls, raop_ntp_t *ntp);
+    void  (*video_flush)(void *cls, raop_ntp_t *ntp);
     double (*audio_set_client_volume)(void *cls);
     void  (*audio_set_volume)(void *cls, float volume);
     void  (*audio_set_metadata)(void *cls, const void *buffer, int buflen);
@@ -93,16 +97,16 @@ struct raop_callbacks_s {
     void  (*audio_stop_coverart_rendering) (void* cls);
     void  (*audio_remote_control_id)(void *cls, const char *dacp_id, const char *active_remote_header);
     void  (*audio_set_progress)(void *cls, uint32_t *start, uint32_t *curr, uint32_t *end);
-    void  (*audio_get_format)(void *cls, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat);
-    void  (*video_report_size)(void *cls, float *width_source, float *height_source, float *width, float *height);
-    void  (*mirror_video_running)(void *cls, bool is_running);
+    void  (*audio_get_format)(void *cls, raop_ntp_t *ntp, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat);
+    void  (*video_report_size)(void *cls, raop_ntp_t *ntp, float *width_source, float *height_source, float *width, float *height);
+    void  (*mirror_video_running)(void *cls, raop_ntp_t *ntp, bool is_running);
     void  (*report_client_request) (void *cls, char *deviceid, char *model, char *name, bool *admit);
     void  (*display_pin) (void *cls, char * pin);
     void  (*register_client) (void *cls, const char *device_id, const char *pk_str, const char *name);
     bool  (*check_register) (void *cls, const char *pk_str);
     const char*  (*passwd) (void *cls, int *len);
     void  (*export_dacp) (void *cls, const char *active_remote, const char *dacp_id);
-    int   (*video_set_codec)(void *cls, video_codec_t codec);
+    int   (*video_set_codec)(void *cls, raop_ntp_t *ntp, video_codec_t codec);
     /* for HLS video player controls */
     void  (*on_video_play) (void *cls, const char *location, const float start_position);
     void  (*on_video_scrub) (void *cls, const float position);
@@ -128,6 +132,7 @@ RAOP_API void raop_set_log_level(raop_t *raop, int level);
 RAOP_API void raop_set_log_callback(raop_t *raop, raop_log_callback_t callback, void *cls);
 RAOP_API int raop_set_plist(raop_t *raop, const char *plist_item, const int value);
 RAOP_API void raop_set_port(raop_t *raop, unsigned short port);
+RAOP_API void raop_set_multiclient(raop_t *raop, int max_clients);
 RAOP_API void raop_set_lang(raop_t *raop, const char *lang);
 RAOP_API void raop_set_udp_ports(raop_t *raop, unsigned short port[3]);
 RAOP_API void raop_set_tcp_ports(raop_t *raop, unsigned short port[2]);

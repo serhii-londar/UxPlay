@@ -662,6 +662,173 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
     return 0;
 }
 
+/* ===== Multi-client mirroring ===== */
+
+typedef struct {
+    GstElement *appsrc;
+    GstElement *pipeline;
+    bool active;
+    guint bus_watch_id;
+} multi_client_video_slot_t;
+
+static multi_client_video_slot_t multi_client_video_slots[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS];
+
+/* Per-slot pipelines otherwise fail completely silently -- gst_parse_launch succeeds and
+ * tcpclientsink still completes its TCP handshake even if an upstream element (decoder,
+ * parser) later errors out on the bus, so the Swift side sees "connected" forever while
+ * no bytes ever arrive. Surface that instead of leaving it invisible. */
+static gboolean multi_client_video_bus_callback(GstBus *bus, GstMessage *message, gpointer user_data) {
+    int slot = GPOINTER_TO_INT(user_data);
+    switch (GST_MESSAGE_TYPE(message)) {
+    case GST_MESSAGE_ERROR: {
+        GError *err = NULL;
+        gchar *debug = NULL;
+        gst_message_parse_error(message, &err, &debug);
+        logger_log(logger, LOGGER_ERR, "multi-client video slot %d: GStreamer error from %s: %s (debug: %s)",
+                   slot, GST_MESSAGE_SRC_NAME(message), err->message, debug ? debug : "none");
+        g_error_free(err);
+        g_free(debug);
+        break;
+    }
+    case GST_MESSAGE_WARNING: {
+        GError *err = NULL;
+        gchar *debug = NULL;
+        gst_message_parse_warning(message, &err, &debug);
+        logger_log(logger, LOGGER_INFO, "multi-client video slot %d: GStreamer warning from %s: %s (debug: %s)",
+                   slot, GST_MESSAGE_SRC_NAME(message), err->message, debug ? debug : "none");
+        g_error_free(err);
+        g_free(debug);
+        break;
+    }
+    case GST_MESSAGE_EOS:
+        logger_log(logger, LOGGER_INFO, "multi-client video slot %d: GStreamer End-Of-Stream", slot);
+        break;
+    default:
+        break;
+    }
+    return TRUE;
+}
+
+/* multi-client mode never calls video_renderer_init(), so `logger` (used by every
+ * function in this file, including the ones above) would otherwise stay NULL and
+ * crash on first use -- set just that, without touching any singleton pipeline state. */
+void video_renderer_multi_client_init(logger_t *render_logger) {
+    logger = render_logger;
+}
+
+int video_renderer_multi_client_start(int slot, const char *parser, const char *rtp_pipeline_template,
+                                      unsigned short port, bool video_sync_enabled) {
+    if (slot < 0 || slot >= VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS) {
+        return -1;
+    }
+    multi_client_video_slot_t *s = &multi_client_video_slots[slot];
+    if (s->active) {
+        video_renderer_multi_client_stop(slot);
+    }
+
+    /* the -vrtp template carries a %PORT% placeholder each slot substitutes with its own loopback port */
+    gchar *port_str = g_strdup_printf("%u", port);
+    GString *pipeline_str = g_string_new(rtp_pipeline_template);
+    for (gchar *pos; (pos = g_strstr_len(pipeline_str->str, -1, "%PORT%")) != NULL; ) {
+        gsize offset = pos - pipeline_str->str;
+        g_string_erase(pipeline_str, offset, 6 /* strlen("%PORT%") */);
+        g_string_insert(pipeline_str, offset, port_str);
+    }
+    g_free(port_str);
+
+    GString *launch = g_string_new("appsrc name=video_source ! queue ! ");
+    g_string_append(launch, parser);
+    g_string_append(launch, " ! rtph264pay ");
+    g_string_append(launch, pipeline_str->str);
+    g_string_free(pipeline_str, TRUE);
+
+    logger_log(logger, LOGGER_DEBUG, "GStreamer multi-client video pipeline (slot %d):\n\"%s\"", slot, launch->str);
+
+    GError *error = NULL;
+    s->pipeline = gst_parse_launch(launch->str, &error);
+    g_string_free(launch, TRUE);
+    if (!s->pipeline) {
+        logger_log(logger, LOGGER_ERR, "multi-client video slot %d: gst_parse_launch failed: %s",
+                   slot, error ? error->message : "(unknown error)");
+        if (error) g_clear_error(&error);
+        return -1;
+    }
+
+    GstClock *clock = gst_system_clock_obtain();
+    g_object_set(clock, "clock-type", GST_CLOCK_TYPE_REALTIME, NULL);
+    gst_pipeline_use_clock(GST_PIPELINE_CAST(s->pipeline), clock);
+    gst_object_unref(clock);
+
+    s->appsrc = gst_bin_get_by_name(GST_BIN(s->pipeline), "video_source");
+    if (!s->appsrc) {
+        logger_log(logger, LOGGER_ERR, "multi-client video slot %d: pipeline has no \"video_source\" appsrc", slot);
+        gst_object_unref(s->pipeline);
+        s->pipeline = NULL;
+        return -1;
+    }
+    GstCaps *caps = gst_caps_from_string(h264_caps);
+    g_object_set(s->appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
+    gst_caps_unref(caps);
+
+    GstBus *bus = gst_element_get_bus(s->pipeline);
+    s->bus_watch_id = gst_bus_add_watch(bus, multi_client_video_bus_callback, GINT_TO_POINTER(slot));
+    gst_object_unref(bus);
+
+    gst_element_set_state(s->pipeline, GST_STATE_PLAYING);
+    s->active = true;
+    return 0;
+}
+
+void video_renderer_multi_client_push(int slot, unsigned char *data, int data_len, uint64_t ntp_time) {
+    if (slot < 0 || slot >= VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS) {
+        return;
+    }
+    multi_client_video_slot_t *s = &multi_client_video_slots[slot];
+    if (!s->active || !s->appsrc) {
+        return;
+    }
+    if (data[0]) {
+        /* first byte nonzero: decryption failed upstream, same guard as the singleton render path */
+        logger_log(logger, LOGGER_ERR, "*** ERROR decryption of video packet failed (slot %d)", slot);
+        return;
+    }
+    GstBuffer *buffer = gst_buffer_new_allocate(NULL, data_len, NULL);
+    g_assert(buffer != NULL);
+    GstClockTime base = gst_element_get_base_time(s->appsrc);
+    GstClockTime pts = (GstClockTime) ntp_time;
+    if (pts >= base) {
+        GST_BUFFER_PTS(buffer) = pts - base;
+    } else {
+        GST_BUFFER_PTS(buffer) = 0;
+    }
+    gst_buffer_fill(buffer, 0, data, data_len);
+    gst_app_src_push_buffer(GST_APP_SRC(s->appsrc), buffer);
+}
+
+void video_renderer_multi_client_stop(int slot) {
+    if (slot < 0 || slot >= VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS) {
+        return;
+    }
+    multi_client_video_slot_t *s = &multi_client_video_slots[slot];
+    if (!s->active) {
+        return;
+    }
+    if (s->appsrc) {
+        gst_app_src_end_of_stream(GST_APP_SRC(s->appsrc));
+    }
+    if (s->pipeline) {
+        gst_element_set_state(s->pipeline, GST_STATE_NULL);
+        gst_object_unref(s->pipeline);
+    }
+    if (s->bus_watch_id) {
+        g_source_remove(s->bus_watch_id);
+        s->bus_watch_id = 0;
+    }
+    s->pipeline = NULL;
+    s->appsrc = NULL;
+    s->active = false;
+}
+
 void video_renderer_flush() {
 }
 

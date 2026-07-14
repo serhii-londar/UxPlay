@@ -24,6 +24,7 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include "audio_renderer.h"
+#include "video_renderer.h" /* VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS -- shared slot-count constant */
 #define SECOND_IN_NSECS 1000000000UL
 
 #define NFORMATS 2     /* set to 4 to enable AAC_LD and PCM:  allowed, but  never seen in real-world use */
@@ -121,8 +122,235 @@ static gboolean check_plugin_feature (const gchar *needed_feature)
 }
 
 bool gstreamer_init(){
-    gst_init(NULL,NULL);    
+    gst_init(NULL,NULL);
     return (bool) check_plugins ();
+}
+
+void audio_renderer_multi_client_init(logger_t *render_logger) {
+    logger = render_logger;
+    /* audio_renderer_init() (which normally detects these) never runs in multi-client
+     * mode -- detect here instead, so per-slot pipelines know which decoders they can use. */
+    aac = check_plugin_feature(avdec_aac);
+    alac = check_plugin_feature(avdec_alac);
+}
+
+/* ===== Multi-client mirroring audio =====
+ * One decode-then-re-encode-to-L16-RTP pipeline per concurrently connected client, mirroring
+ * video_renderer_multi_client_* (see video_renderer.c). Unlike the singleton path's NFORMATS=2
+ * pre-built pipelines, this lazily builds just the one pipeline matching the slot's actual ct. */
+
+typedef struct {
+    GstElement *appsrc;
+    GstElement *pipeline;
+    bool active;
+    unsigned char ct;
+    guint bus_watch_id;
+} multi_client_audio_slot_t;
+
+static multi_client_audio_slot_t multi_client_audio_slots[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS];
+
+static gboolean multi_client_audio_bus_callback(GstBus *bus, GstMessage *message, gpointer user_data) {
+    int slot = GPOINTER_TO_INT(user_data);
+    switch (GST_MESSAGE_TYPE(message)) {
+    case GST_MESSAGE_ERROR: {
+        GError *err = NULL;
+        gchar *debug = NULL;
+        gst_message_parse_error(message, &err, &debug);
+        logger_log(logger, LOGGER_ERR, "multi-client audio slot %d: GStreamer error from %s: %s (debug: %s)",
+                   slot, GST_MESSAGE_SRC_NAME(message), err->message, debug ? debug : "none");
+        g_error_free(err);
+        g_free(debug);
+        break;
+    }
+    case GST_MESSAGE_WARNING: {
+        GError *err = NULL;
+        gchar *debug = NULL;
+        gst_message_parse_warning(message, &err, &debug);
+        logger_log(logger, LOGGER_INFO, "multi-client audio slot %d: GStreamer warning from %s: %s (debug: %s)",
+                   slot, GST_MESSAGE_SRC_NAME(message), err->message, debug ? debug : "none");
+        g_error_free(err);
+        g_free(debug);
+        break;
+    }
+    case GST_MESSAGE_EOS:
+        logger_log(logger, LOGGER_INFO, "multi-client audio slot %d: GStreamer End-Of-Stream", slot);
+        break;
+    default:
+        break;
+    }
+    return TRUE;
+}
+
+int audio_renderer_multi_client_start(int slot, unsigned char ct, const char *rtp_pipeline_template, unsigned short port) {
+    if (slot < 0 || slot >= VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS) {
+        return -1;
+    }
+    multi_client_audio_slot_t *s = &multi_client_audio_slots[slot];
+    if (s->active) {
+        if (s->ct == ct) {
+            return 0; /* already running the right codec for this slot */
+        }
+        audio_renderer_multi_client_stop(slot);
+    }
+
+    const char *decoder;
+    const char *caps_str;
+    switch (ct) {
+    case 8: /* AAC-ELD */
+    case 4: /* AAC-LC */
+        if (!aac) {
+            logger_log(logger, LOGGER_ERR, "multi-client audio slot %d: GStreamer libav avdec_aac missing, cannot decode AAC audio", slot);
+            return -1;
+        }
+        decoder = "avdec_aac ! ";
+        caps_str = (ct == 8) ? aac_eld_caps : aac_lc_caps;
+        break;
+    case 2: /* ALAC */
+        if (!alac) {
+            logger_log(logger, LOGGER_ERR, "multi-client audio slot %d: GStreamer libav avdec_alac missing, cannot decode ALAC audio", slot);
+            return -1;
+        }
+        decoder = "avdec_alac ! ";
+        caps_str = alac_caps;
+        break;
+    case 1: /* PCM */
+        decoder = "";
+        caps_str = lpcm_caps;
+        break;
+    default:
+        logger_log(logger, LOGGER_ERR, "multi-client audio slot %d: unknown audio compression type ct = %d", slot, ct);
+        return -1;
+    }
+
+    gchar *port_str = g_strdup_printf("%u", port);
+    GString *pipeline_str = g_string_new(rtp_pipeline_template);
+    for (gchar *pos; (pos = g_strstr_len(pipeline_str->str, -1, "%PORT%")) != NULL; ) {
+        gsize offset = pos - pipeline_str->str;
+        g_string_erase(pipeline_str, offset, 6 /* strlen("%PORT%") */);
+        g_string_insert(pipeline_str, offset, port_str);
+    }
+    g_free(port_str);
+
+    GString *launch = g_string_new("appsrc name=audio_source ! queue ! ");
+    g_string_append(launch, decoder);
+    g_string_append(launch, "audioconvert ! audioresample ! audio/x-raw,format=S16BE,rate=44100,channels=2 ! rtpL16pay ");
+    g_string_append(launch, pipeline_str->str);
+    g_string_free(pipeline_str, TRUE);
+
+    logger_log(logger, LOGGER_DEBUG, "GStreamer multi-client audio pipeline (slot %d):\n\"%s\"", slot, launch->str);
+
+    GError *error = NULL;
+    s->pipeline = gst_parse_launch(launch->str, &error);
+    g_string_free(launch, TRUE);
+    if (!s->pipeline) {
+        logger_log(logger, LOGGER_ERR, "multi-client audio slot %d: gst_parse_launch failed: %s",
+                   slot, error ? error->message : "(unknown error)");
+        if (error) g_clear_error(&error);
+        return -1;
+    }
+
+    GstClock *clock = gst_system_clock_obtain();
+    g_object_set(clock, "clock-type", GST_CLOCK_TYPE_REALTIME, NULL);
+    gst_pipeline_use_clock(GST_PIPELINE_CAST(s->pipeline), clock);
+    gst_object_unref(clock);
+
+    s->appsrc = gst_bin_get_by_name(GST_BIN(s->pipeline), "audio_source");
+    if (!s->appsrc) {
+        logger_log(logger, LOGGER_ERR, "multi-client audio slot %d: pipeline has no \"audio_source\" appsrc", slot);
+        gst_object_unref(s->pipeline);
+        s->pipeline = NULL;
+        return -1;
+    }
+    GstCaps *caps = gst_caps_from_string(caps_str);
+    g_object_set(s->appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
+    gst_caps_unref(caps);
+
+    GstBus *bus = gst_element_get_bus(s->pipeline);
+    s->bus_watch_id = gst_bus_add_watch(bus, multi_client_audio_bus_callback, GINT_TO_POINTER(slot));
+    gst_object_unref(bus);
+
+    gst_element_set_state(s->pipeline, GST_STATE_PLAYING);
+    s->active = true;
+    s->ct = ct;
+    return 0;
+}
+
+void audio_renderer_multi_client_push(int slot, unsigned char *data, int data_len, uint64_t ntp_time) {
+    if (slot < 0 || slot >= VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS) {
+        return;
+    }
+    multi_client_audio_slot_t *s = &multi_client_audio_slots[slot];
+    if (!s->active || !s->appsrc || data_len <= 0) {
+        return;
+    }
+
+    /* Same first-byte sanity check as the singleton audio_renderer_render_buffer -- skip
+     * frames that don't match the codec this slot's pipeline was built for, rather than
+     * feeding garbage into the decoder (which would surface as a bus error above). */
+    bool valid;
+    switch (s->ct) {
+    case 8: /* AAC-ELD */
+        switch (data[0]) {
+        case 0x8c: case 0x8d: case 0x8e:
+        case 0x80: case 0x81: case 0x82:
+            valid = true;
+            break;
+        default:
+            valid = false;
+            break;
+        }
+        break;
+    case 2: /* ALAC */
+        valid = (data[0] == 0x20);
+        break;
+    case 4: /* AAC-LC */
+        valid = (data[0] == 0xff);
+        break;
+    default:
+        valid = true;
+        break;
+    }
+    if (!valid) {
+        logger_log(logger, LOGGER_ERR, "multi-client audio slot %d: invalid audio frame (ct %d) skipped, first byte 0x%2.2x",
+                   slot, s->ct, (unsigned int) data[0]);
+        return;
+    }
+
+    GstBuffer *buffer = gst_buffer_new_allocate(NULL, data_len, NULL);
+    g_assert(buffer != NULL);
+    GstClockTime base = gst_element_get_base_time(s->appsrc);
+    GstClockTime pts = (GstClockTime) ntp_time;
+    if (pts >= base) {
+        GST_BUFFER_PTS(buffer) = pts - base;
+    } else {
+        GST_BUFFER_PTS(buffer) = 0;
+    }
+    gst_buffer_fill(buffer, 0, data, data_len);
+    gst_app_src_push_buffer(GST_APP_SRC(s->appsrc), buffer);
+}
+
+void audio_renderer_multi_client_stop(int slot) {
+    if (slot < 0 || slot >= VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS) {
+        return;
+    }
+    multi_client_audio_slot_t *s = &multi_client_audio_slots[slot];
+    if (!s->active) {
+        return;
+    }
+    if (s->appsrc) {
+        gst_app_src_end_of_stream(GST_APP_SRC(s->appsrc));
+    }
+    if (s->pipeline) {
+        gst_element_set_state(s->pipeline, GST_STATE_NULL);
+        gst_object_unref(s->pipeline);
+    }
+    if (s->bus_watch_id) {
+        g_source_remove(s->bus_watch_id);
+        s->bus_watch_id = 0;
+    }
+    s->pipeline = NULL;
+    s->appsrc = NULL;
+    s->active = false;
 }
 
 void audio_renderer_init(logger_t *render_logger, const char* audiosink, const bool* audio_sync, const bool* video_sync, const char *artp_pipeline) {

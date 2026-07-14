@@ -27,6 +27,7 @@
 #include <string>
 #include <algorithm>
 #include <vector>
+#include <map>
 #include <fstream>
 #include <sstream>
 #include <iterator>
@@ -201,6 +202,10 @@ static std::string coverart_artist;
 static std::string ble_filename = "";
 static std::string rtp_pipeline = "";
 static std::string audio_rtp_pipeline = "";
+/* multi-client mirroring: off by default (0). See raop_set_multiclient() and the
+ * "Multi-client mirroring" section near the server callbacks for the rest of it. */
+static int multi_client_max = 0;
+static unsigned short multi_client_base_port = 0;
 static GMainLoop *gmainloop = NULL;
 static bool mux_to_file = false;
 static std::string mux_filename = "recording";
@@ -676,7 +681,9 @@ static void main_loop()  {
     preserve_connections = false;
     n_video_renderers = 0;
     n_audio_renderers = 0;
-    if (use_video) {
+    /* multi-client mode never calls video_renderer_init/audio_renderer_init (see main()), so there
+     * are no renderer_type[] pipelines here to attach a GstBus watch to -- skip both blocks below. */
+    if (use_video && multi_client_max == 0) {
         n_video_renderers = 1;
         relaunch_video = true;
         if (url.empty()) {
@@ -700,7 +707,7 @@ static void main_loop()  {
             gst_video_bus_watch_id[i] = (guint) video_renderer_listen((void *)loop, i);
         }
     }
-    if (use_audio) {
+    if (use_audio && multi_client_max == 0) {
         rtptime_start = 0;
         rtptime_end = 0;
         monitor_progress = true;
@@ -710,7 +717,7 @@ static void main_loop()  {
         n_audio_renderers = 2;
         g_assert(n_audio_renderers <= MAX_AUDIO_RENDERERS);
         for (int i = 0; i < n_audio_renderers; i++) {
-            gst_audio_bus_watch_id[i] = (guint) audio_renderer_listen((void *)loop, i);      
+            gst_audio_bus_watch_id[i] = (guint) audio_renderer_listen((void *)loop, i);
         }
     }
 
@@ -980,6 +987,9 @@ static void print_info (char *name) {
     printf("-nc       Do NOT  Close video window when client stops mirroring\n");
     printf("-nc no    Cancel the -nc option (DO close video window) \n");
     printf("-nohold   Drop current connection when new client connects.\n");
+    printf("-multi-client <max> <base_port>  EXPERIMENTAL: serve up to <max> clients concurrently\n");
+    printf("          under one name instead of one client at a time. Requires \"-vrtp\"/\"-artp\"\n");
+    printf("          pipelines with a %%PORT%% placeholder; video is per-client, audio is not yet.\n");
     printf("-restrict Restrict clients to those specified by \"-allow <deviceID>\"\n");
     printf("          UxPlay displays deviceID when a client attempts to connect\n");
     printf("          Use \"-restrict no\" for no client restrictions (default)\n");
@@ -1468,6 +1478,19 @@ static void parse_arguments (int argc, char *argv[]) {
           }
 	  audio_rtp_pipeline.erase();
 	  audio_rtp_pipeline.append(argv[++i]);
+	} else if (arg == "-multi-client") {
+	  unsigned int max_clients = 0, base_port = 0;
+	  if (i >= argc - 2 || !get_value(argv[i+1], &max_clients) || !get_value(argv[i+2], &base_port) ||
+	      max_clients < 1 || max_clients > VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS || base_port == 0 || base_port > 65000) {
+	    fprintf(stderr, "option \"-multi-client\" must be followed by <max_clients> <base_port>:\n"
+		    "  1 <= max_clients <= %d, and video/audio loopback ports base_port..base_port+2*(max_clients-1)+1 must be free.\n"
+		    "  requires \"-vrtp\"/\"-artp\" pipelines containing a %%PORT%% placeholder for the per-slot loopback port.\n",
+		    VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS);
+	    exit(1);
+	  }
+	  multi_client_max = (int) max_clients;
+	  multi_client_base_port = (unsigned short) base_port;
+	  i += 2;
 	} else if (arg == "-vdmp") {
             dump_video = true;
             if (i < argc - 1 && *argv[i+1] != '-') {
@@ -2102,12 +2125,52 @@ static bool check_blocked_client(char *deviceid) {
     return ret;
 }
 
+// ===== Multi-client mirroring =====
+// Off by default (multi_client_max == 0): behavior is unchanged from upstream.
+// When on, each concurrent AirPlay connection gets its own slot (0..multi_client_max-1),
+// each slot its own loopback port and its own GStreamer pipeline in video_renderer.c,
+// instead of every connection sharing the single process-wide renderer.
+static std::map<raop_ntp_t*, int> multi_client_slot_by_ntp;
+static bool multi_client_slot_busy[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = { false };
+
+static int multi_client_alloc_slot(raop_ntp_t *ntp) {
+    auto it = multi_client_slot_by_ntp.find(ntp);
+    if (it != multi_client_slot_by_ntp.end()) {
+        return it->second;
+    }
+    for (int i = 0; i < multi_client_max && i < VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS; i++) {
+        if (!multi_client_slot_busy[i]) {
+            multi_client_slot_busy[i] = true;
+            multi_client_slot_by_ntp[ntp] = i;
+            return i;
+        }
+    }
+    LOGE("multi-client: no free slot for new connection (max = %d)", multi_client_max);
+    return -1;
+}
+
+/* Safe to call more than once for the same ntp (video_reset and conn_destroy can both
+ * fire for one connection's teardown) -- second call is a no-op since the map entry is gone. */
+static void multi_client_release_slot(raop_ntp_t *ntp) {
+    auto it = multi_client_slot_by_ntp.find(ntp);
+    if (it == multi_client_slot_by_ntp.end()) {
+        return;
+    }
+    int slot = it->second;
+    video_renderer_multi_client_stop(slot);
+    audio_renderer_multi_client_stop(slot);
+    printf("CLIENT_DISCONNECTED slot=%d\n", slot);
+    fflush(stdout);
+    multi_client_slot_busy[slot] = false;
+    multi_client_slot_by_ntp.erase(it);
+}
+
 // Server callbacks
 
 
 //to be simplified
 
-extern "C" void video_reset(void *cls, reset_type_t type) {
+extern "C" void video_reset(void *cls, raop_ntp_t *ntp, reset_type_t type) {
     switch (type) {
     case RESET_TYPE_NOHOLD:
         LOGD("video_reset: type = NoHold");
@@ -2136,7 +2199,13 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
         LOGD("video_reset: type = RTP_to_HLS_Shutdown");
         preserve_connections = true;
     case RESET_TYPE_RTP_SHUTDOWN:
-        LOGD("video_reset: type = RTP_Shutdown");      
+        LOGD("video_reset: type = RTP_Shutdown");
+        if (multi_client_max > 0 && ntp) {
+            /* tear down only this client's slot; the shared renderer/main loop below is untouched
+             * so every other concurrently connected client keeps streaming without interruption */
+            multi_client_release_slot(ntp);
+            return;
+        }
         if (use_video) {
             video_renderer_stop();
         }
@@ -2167,8 +2236,26 @@ extern "C" void video_reset(void *cls, reset_type_t type) {
     reset_loop = true;
 }
 
-extern "C" int video_set_codec(void *cls, video_codec_t codec) {
+extern "C" int video_set_codec(void *cls, raop_ntp_t *ntp, video_codec_t codec) {
     bool video_is_h265 = (codec == VIDEO_CODEC_H265);
+    if (multi_client_max > 0 && ntp) {
+        if (video_is_h265) {
+            LOGE("multi-client mode only supports H264; client sent H265, dropping connection");
+            return -1;
+        }
+        int slot = multi_client_alloc_slot(ntp);
+        if (slot < 0) {
+            return -1;
+        }
+        unsigned short port = multi_client_base_port + (unsigned short) (slot * 2);
+        if (video_renderer_multi_client_start(slot, video_parser.c_str(), rtp_pipeline.c_str(), port, video_sync) < 0) {
+            multi_client_release_slot(ntp);
+            return -1;
+        }
+        printf("CLIENT_CONNECTED slot=%d video_port=%u\n", slot, port);
+        fflush(stdout);
+        return 0;
+    }
     if (mux_to_file) {
         mux_renderer_choose_video_codec(video_is_h265);
     }
@@ -2217,11 +2304,20 @@ extern "C" void export_dacp(void *cls, const char *active_remote, const char *da
 extern "C" void conn_init (void *cls) {
     open_connections++;
     LOGD("Open connections: %i", open_connections);
+    if (open_connections == 1 && multi_client_max == 0) {
+        /* multi-client mode stays discoverable while clients are connected so other
+         * devices can still find and join the same name; legacy mode hides itself
+         * once occupied since it can only ever serve one client at a time. */
+        unregister_dnssd();
+    }
     //video_renderer_update_background(1);
 }
 
-extern "C" void conn_destroy (void *cls) {
+extern "C" void conn_destroy (void *cls, raop_ntp_t *ntp) {
     //video_renderer_update_background(-1);
+    if (multi_client_max > 0 && ntp) {
+        multi_client_release_slot(ntp);
+    }
     open_connections--;
     LOGD("Open connections: %i", open_connections);
     if (open_connections == 0) {
@@ -2235,26 +2331,36 @@ extern "C" void conn_destroy (void *cls) {
         if (mux_to_file) {
             mux_renderer_stop();
         }
+        if (multi_client_max == 0) {
+            register_dnssd();
+        }
     }
 }
 
-extern "C" void conn_feedback (void *cls) {
+extern "C" void conn_feedback (void *cls, raop_ntp_t *ntp) {
     /* received client heartbeat signal: connection still exists */
     missed_feedback = 0;
 }
 
-extern "C" void conn_reset (void *cls, int reason) {
+extern "C" void conn_reset (void *cls, raop_ntp_t *ntp, int reason) {
     switch (reason) {
     case 1:
         LOGI("*** ERROR lost connection with client (network problem?)");
 	break;
     case 2:
         LOGI("*** ERROR Unsupported HLS streaming source: (exit attempt to stream)");
-	break;      
+	break;
     default:
       break;
     }
-    
+
+    if (multi_client_max > 0 && ntp) {
+        /* only this one client dropped; every other concurrently connected client and the
+         * shared main loop/httpd must keep running, so release just this client's slot */
+        multi_client_release_slot(ntp);
+        return;
+    }
+
     if (!nofreeze) {
         close_window = false;    /* leave "frozen" window open */
     }
@@ -2279,12 +2385,26 @@ extern "C" void report_client_request(void *cls, char *deviceid, char * model, c
         LOGI("*** attempt to connect by blocked client (clientID %s): DENIED\n", deviceid);
     }
     // Pass device model to renderer for device frame display
-    if (*admit && use_video) {
+    if (*admit && use_video && multi_client_max == 0) {
         video_renderer_set_device_model(model, name);
     }
 }
 
 extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *data) {
+    if (multi_client_max > 0 && ntp) {
+        auto it = multi_client_slot_by_ntp.find(ntp);
+        if (it == multi_client_slot_by_ntp.end()) {
+            /* audio_get_format (which allocates the slot) hasn't run yet for this connection */
+            return;
+        }
+        if (!remote_clock_offset) {
+            uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
+            remote_clock_offset = local_time - data->ntp_time_remote;
+        }
+        data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
+        audio_renderer_multi_client_push(it->second, data->data, data->data_len, data->ntp_time_remote);
+        return;
+    }
     if (dump_audio) {
         dump_audio_to_file(data->data, data->data_len, (data->data)[0] & 0xf0);
     }
@@ -2320,6 +2440,20 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
 }
 
 extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *data) {
+    if (multi_client_max > 0 && ntp) {
+        auto it = multi_client_slot_by_ntp.find(ntp);
+        if (it == multi_client_slot_by_ntp.end()) {
+            /* video_set_codec (which allocates the slot) hasn't run yet for this connection */
+            return;
+        }
+        if (!remote_clock_offset) {
+            uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
+            remote_clock_offset = local_time - data->ntp_time_remote;
+        }
+        data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
+        video_renderer_multi_client_push(it->second, data->data, data->data_len, data->ntp_time_remote);
+        return;
+    }
     if (dump_video) {
         dump_video_to_file(data->data, data->data_len);
     }
@@ -2346,7 +2480,7 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
 }
 
 #ifdef DBUS
-extern "C" void mirror_video_running  (void *cls, bool is_running) {
+extern "C" void mirror_video_running  (void *cls, raop_ntp_t *ntp, bool is_running) {
     if (scrsv != 1) {
         return;
     }
@@ -2354,26 +2488,35 @@ extern "C" void mirror_video_running  (void *cls, bool is_running) {
 }
 #endif
 
-extern "C" void video_pause (void *cls) {
+extern "C" void video_pause (void *cls, raop_ntp_t *ntp) {
+    if (multi_client_max > 0) {
+        return; /* per-client pipelines don't support pause/resume yet */
+    }
     if (use_video) {
         video_renderer_pause();
     }
 }
 
-extern "C" void video_resume (void *cls) {
+extern "C" void video_resume (void *cls, raop_ntp_t *ntp) {
+    if (multi_client_max > 0) {
+        return;
+    }
     if (use_video) {
         video_renderer_resume();
     }
 }
 
 
-extern "C" void audio_flush (void *cls) {
+extern "C" void audio_flush (void *cls, raop_ntp_t *ntp) {
+    if (multi_client_max > 0) {
+        return; /* audio isn't wired up per-client yet, see audio_process */
+    }
     if (use_audio) {
         audio_renderer_flush();
     }
 }
 
-extern "C" void video_flush (void *cls) {
+extern "C" void video_flush (void *cls, raop_ntp_t *ntp) {
     if (use_video) {
         video_renderer_flush();
     }
@@ -2385,7 +2528,7 @@ extern "C" double audio_set_client_volume(void *cls) {
 
 extern "C" void audio_set_volume (void *cls, float volume) {
     double db, db_flat, frac, gst_volume;
-    if (!use_audio) {
+    if (multi_client_max > 0 || !use_audio) {
       return;
     }
     /* convert from AirPlay dB  volume in range {-30dB : 0dB}, to GStreamer volume */
@@ -2428,7 +2571,7 @@ extern "C" void audio_set_volume (void *cls, float volume) {
     audio_renderer_set_volume(gst_volume);
 }
 
-extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat) {
+extern "C" void audio_get_format (void *cls, raop_ntp_t *ntp, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat) {
     unsigned char type;
     LOGI("ct=%d spf=%d usingScreen=%d isMedia=%d  audioFormat=0x%lx",*ct, *spf, *usingScreen, *isMedia, (unsigned long) *audioFormat);
     switch (*ct) {
@@ -2447,8 +2590,19 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
         audio_dumpfile = NULL;
     }
     audio_type = type;
-    
-    if (use_audio) {
+
+    if (multi_client_max > 0 && ntp) {
+        int slot = multi_client_alloc_slot(ntp);
+        if (slot >= 0) {
+            unsigned short port = multi_client_base_port + (unsigned short) (slot * 2) + 1;
+            if (audio_renderer_multi_client_start(slot, *ct, audio_rtp_pipeline.c_str(), port) < 0) {
+                LOGE("multi-client audio slot %d: failed to start, audio disabled for this client", slot);
+            } else {
+                printf("CLIENT_AUDIO_CONNECTED slot=%d audio_port=%u ct=%d\n", slot, port, (int) *ct);
+                fflush(stdout);
+            }
+        }
+    } else if (multi_client_max == 0 && use_audio) {
       audio_renderer_start(ct);
     }
 
@@ -2464,13 +2618,32 @@ extern "C" void audio_get_format (void *cls, unsigned char *ct, unsigned short *
     }
 }
 
-extern "C" void video_report_size(void *cls, float *width_source, float *height_source, float *width, float *height) {
+/* Client tore down just its audio sub-stream (stream type 96) while leaving video mirroring
+ * running -- release this slot's audio pipeline so a later audio SETUP on the same connection
+ * rebuilds cleanly instead of hitting audio_renderer_multi_client_start()'s "already active,
+ * same codec" no-op against a pipeline TEARDOWN already stopped feeding. */
+extern "C" void audio_reset(void *cls, raop_ntp_t *ntp) {
+    if (multi_client_max > 0 && ntp) {
+        auto it = multi_client_slot_by_ntp.find(ntp);
+        if (it != multi_client_slot_by_ntp.end()) {
+            audio_renderer_multi_client_stop(it->second);
+        }
+    }
+}
+
+extern "C" void video_report_size(void *cls, raop_ntp_t *ntp, float *width_source, float *height_source, float *width, float *height) {
+    if (multi_client_max > 0) {
+        return; /* the singleton renderer this reports into doesn't exist in this mode */
+    }
     if (use_video) {
         video_renderer_size(width_source, height_source, width, height);
     }
 }
 
 extern "C" void audio_set_coverart(void *cls, const void *buffer, int buflen) {
+    if (multi_client_max > 0) {
+        return; /* coverart rendering isn't wired up per-client */
+    }
     if (buffer && coverart_filename.length()) {
         write_coverart(coverart_filename.c_str(), buffer, buflen);
         LOGI("coverart size %d written to %s", buflen,  coverart_filename.c_str());
@@ -2483,7 +2656,8 @@ extern "C" void audio_set_coverart(void *cls, const void *buffer, int buflen) {
 
 extern "C" void audio_stop_coverart_rendering(void *cls) {
     if (render_coverart) {
-        video_reset(cls, RESET_TYPE_RTP_SHUTDOWN);
+        /* coverart display is a shared, process-wide surface, not tied to one client */
+        video_reset(cls, NULL, RESET_TYPE_RTP_SHUTDOWN);
     }
 }
 
@@ -2538,7 +2712,7 @@ extern "C" void audio_set_metadata(void *cls, const void *buffer, int buflen) {
         LOGE("%d bytes of metadata were not processed", buflen);
     }
     // Update video renderer with track metadata for cover art display
-    if (render_coverart) {
+    if (render_coverart && multi_client_max == 0) {
         video_renderer_set_track_metadata(
             track_title.length() ? track_title.c_str() : NULL,
             artist.length() ? artist.c_str() : NULL,
@@ -2587,7 +2761,8 @@ extern "C" void on_video_play(void *cls, const char* location, const float start
     relaunch_video = true;
     preserve_connections = true;
     LOGI("********************on_video_play: location = %s*** start position %f ********************", url.c_str(), start_position);
-    video_reset(cls, RESET_TYPE_ON_VIDEO_PLAY);
+    /* HLS playback control, not tied to a mirroring client */
+    video_reset(cls, NULL, RESET_TYPE_ON_VIDEO_PLAY);
 }
 
 extern "C" void on_video_scrub(void *cls, const float position) {
@@ -2689,6 +2864,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.audio_set_client_volume = audio_set_client_volume;
     raop_cbs.audio_set_volume = audio_set_volume;
     raop_cbs.audio_get_format = audio_get_format;
+    raop_cbs.audio_reset = audio_reset;
     raop_cbs.video_report_size = video_report_size;
     raop_cbs.audio_set_metadata = audio_set_metadata;
     raop_cbs.audio_set_coverart = audio_set_coverart;
@@ -2724,6 +2900,11 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
         LOGE("Error initializing raop (2)!");
         free (raop);
         return -1;
+    }
+    if (multi_client_max > 0) {
+        raop_set_multiclient(raop, multi_client_max);
+        LOGI("multi-client mode: up to %d concurrent clients, loopback ports from %u",
+             multi_client_max, multi_client_base_port);
     }
 
     /* write desired display pixel width, pixel height, refresh_rate, max_fps, overscanned.  */
@@ -3126,6 +3307,21 @@ int main (int argc, char *argv[]) {
     logger_set_callback(render_logger, log_callback, NULL);
     logger_set_level(render_logger, log_level);
 
+    if (multi_client_max > 0) {
+        /* multi-client mode builds one independent pipeline per connection on demand
+         * (see video_set_codec/video_renderer_multi_client_start); the singleton
+         * renderers below are for the legacy single-client path and are never fed
+         * data in this mode, so skip them entirely -- their -vrtp/-artp templates
+         * contain a literal "%PORT%" placeholder that isn't a valid port on its own. */
+        LOGI("multi-client mode: skipping singleton audio/video renderer init");
+        video_renderer_multi_client_init(render_logger);
+        audio_renderer_multi_client_init(render_logger);
+#ifdef __OpenBSD__
+        if (pledge("stdio rpath wpath cpath inet unix prot_exec", NULL) == -1) {
+            err(1, "pledge");
+        }
+#endif
+    } else {
     if (use_audio) {
         audio_renderer_init(render_logger, audiosink.c_str(), &audio_sync, &video_sync, audio_rtp_pipeline.c_str());
     } else {
@@ -3143,6 +3339,7 @@ int main (int argc, char *argv[]) {
             err(1, "pledge");
         }
 #endif
+    }
     }
 
     if (mux_to_file) {

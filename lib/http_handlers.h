@@ -394,7 +394,7 @@ http_handler_playback_info(raop_conn_t *conn, http_request_t *request, http_resp
         logger_log(raop->logger, LOGGER_DEBUG, "playback_info not available (finishing)");
         //httpd_remove_known_connections(raop->httpd);
         http_response_set_disconnect(response,1);
-        raop->callbacks.video_reset(raop->callbacks.cls, RESET_TYPE_HLS_SHUTDOWN);
+        raop->callbacks.video_reset(raop->callbacks.cls, conn->raop_ntp, RESET_TYPE_HLS_SHUTDOWN);
         return;
     } else if (playback_info.position == -1.0) {
         logger_log(raop->logger, LOGGER_DEBUG, "playback_info not available");
@@ -932,7 +932,7 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
     logger_log(raop->logger, LOGGER_ERR, "Could not find valid Plist Data for POST/play request, Unhandled");
     http_response_init(response, "HTTP/1.1", 400, "Bad Request");
     http_response_set_disconnect(response, 1);
-    raop->callbacks.conn_reset(raop->callbacks.cls, 2);
+    raop->callbacks.conn_reset(raop->callbacks.cls, conn->raop_ntp, 2);
 }
 
 /* the HLS handler handles http requests GET /[uri] on the HLS channel from the media player to the Server, asking for
