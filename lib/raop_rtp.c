@@ -603,12 +603,11 @@ raop_rtp_thread_udp(void *arg)
                  raop_rtp->initial_sync = true;
             }	    
 
-            if (packetlen == 12 ||(packetlen == 16 && memcmp(packet + 12, no_data_marker, 4) == 0)) {
-                /* this is a "no data" packet */
-	        /* the first such packet could be used to provide the initial rtptime and seqnum formerly given in the RECORD request */
-                continue;
-            }
-	    
+            /* "no data" packets (packetlen == 12, or 16 with the no_data_marker payload) are NOT
+             * skipped here: raop_buffer_enqueue() records them as filled entries with an empty
+             * payload so they don't leave permanent seqnum holes that stall dequeuing after the
+             * sender pauses/resumes its audio source. */
+
             if (raop_rtp->ct == 2 && packetlen == 44)  continue;   /* ignore the ALAC packets with format information only. */
 
             int result = raop_buffer_enqueue(raop_rtp->buffer, packet, packetlen, 1);
