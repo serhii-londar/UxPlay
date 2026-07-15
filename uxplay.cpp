@@ -2508,8 +2508,12 @@ extern "C" void video_resume (void *cls, raop_ntp_t *ntp) {
 
 
 extern "C" void audio_flush (void *cls, raop_ntp_t *ntp) {
+    /* The FLUSH-critical work (resetting the RTP ring buffer to next_seq) happens in
+     * raop_rtp_process_events(); renderer-side flush is a no-op on both paths
+     * (audio_renderer_flush() is empty, and the per-client pipelines need no flush --
+     * they are fed only already-dequeued contiguous audio). */
     if (multi_client_max > 0) {
-        return; /* audio isn't wired up per-client yet, see audio_process */
+        return;
     }
     if (use_audio) {
         audio_renderer_flush();

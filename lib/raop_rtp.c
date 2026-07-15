@@ -332,6 +332,12 @@ raop_rtp_process_events(raop_rtp_t *raop_rtp, void *cb_data)
 
     /* Handle flush if requested */
     if (flush != NO_FLUSH) {
+        /* The sender discards everything before next_seq when it sends FLUSH (e.g. on a
+         * track/video skip), so the ring buffer must jump there too: without this, dequeue
+         * keeps waiting on pre-flush seqnums that will never arrive (resend requests for
+         * them come back empty) and audio stalls until the 256-entry window overruns. */
+        logger_log(raop_rtp->logger, LOGGER_INFO, "raop_rtp audio FLUSH: resetting buffer, next_seq = %d", flush);
+        raop_buffer_flush(raop_rtp->buffer, flush);
         if (raop_rtp->callbacks.audio_flush) {
             raop_rtp->callbacks.audio_flush(raop_rtp->callbacks.cls, raop_rtp->ntp);
         }
@@ -682,6 +688,16 @@ raop_rtp_start_audio(raop_rtp_t *raop_rtp,  unsigned short *control_rport, unsig
 
     raop_rtp->ct = *ct;
     raop_rtp->rtp_clock_rate = SECOND_IN_NSECS / *sr;
+
+    /* A reused raop_rtp (audio re-SETUP after a partial audio-only TEARDOWN on the same
+     * connection) must not keep the previous stream's rtp<->ntp mapping: iOS restarts the
+     * audio RTP timeline on re-SETUP (observed: sync_rtp jumped backward by ~594M ticks,
+     * ~3.7 hours), so packets arriving before the new stream's first sync packet would get
+     * timestamps hours off with the stale mapping. Clear it so this stream re-syncs from
+     * scratch (AAC bootstraps a fake initial sync from the video arrival offset meanwhile). */
+    raop_rtp->initial_sync = false;
+    raop_rtp->rtp_sync = 0;
+    raop_rtp->client_ntp_sync = 0;
 
     /* Initialize ports and sockets */
     raop_rtp->control_lport = *control_lport;

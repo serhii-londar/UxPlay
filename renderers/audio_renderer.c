@@ -325,6 +325,21 @@ void audio_renderer_multi_client_push(int slot, unsigned char *data, int data_le
     } else {
         GST_BUFFER_PTS(buffer) = 0;
     }
+
+    /* Sanity-clamp timestamps mapped with a desynced rtp<->ntp mapping (e.g. audio re-SETUP
+     * before the new stream's first sync packet): a PTS far ahead of the pipeline's running
+     * time would make the (sync=true) sink wait that long, silently blocking every buffer
+     * behind it. Late/past PTS is harmless (rendered immediately) and left alone. */
+    GstClockTime running_time = gst_element_get_current_running_time(s->appsrc);
+    if (GST_CLOCK_TIME_IS_VALID(running_time) &&
+        GST_BUFFER_PTS(buffer) > running_time + 5 * GST_SECOND) {
+        logger_log(logger, LOGGER_INFO,
+                   "multi-client audio slot %d: buffer PTS %8.6f is %8.6f s ahead of pipeline running time, clamping",
+                   slot, ((double) GST_BUFFER_PTS(buffer)) / GST_SECOND,
+                   ((double) (GST_BUFFER_PTS(buffer) - running_time)) / GST_SECOND);
+        GST_BUFFER_PTS(buffer) = running_time;
+    }
+
     gst_buffer_fill(buffer, 0, data, data_len);
     gst_app_src_push_buffer(GST_APP_SRC(s->appsrc), buffer);
 }

@@ -35,6 +35,21 @@
 
 #define RAOP_BUFFER_LENGTH 256
 
+/* Number of consecutive resend rounds (one per received data packet, so roughly 90/sec for
+ * AAC-ELD) to wait on the same missing seqnum before concluding the sender no longer has it
+ * (it was flushed on a track skip, or only an empty 8-byte resend response exists) and
+ * skipping past it instead of stalling playback forever. ~1s at typical packet rates;
+ * normal resends arrive within 1-2 rounds. */
+#define RAOP_RESEND_STALL_LIMIT 100
+
+/* Number of consecutive incoming packets rejected as "too late" (seqnum behind the buffer
+ * window) before concluding the window itself is desynced from the live stream -- e.g. a
+ * FLUSH carried an RTP-Info next_seq that doesn't match the seqnums the sender actually
+ * continues with -- and resetting the window to restart at the live position. A few dozen
+ * genuinely-late stragglers can arrive right after a real flush (in-flight packets, resent
+ * copies), but they can't sustain a run this long; a desynced window rejects everything. */
+#define RAOP_LATE_REJECT_LIMIT 50
+
 typedef struct {
     /* Data available */
     int filled;
@@ -59,6 +74,15 @@ struct raop_buffer_s {
     int is_empty;
     unsigned short first_seqnum;
     unsigned short last_seqnum;
+
+    /* Stall detection: how many resend rounds the head of the buffer has been
+     * stuck on the same missing seqnum (see RAOP_RESEND_STALL_LIMIT) */
+    unsigned short stalled_seqnum;
+    int stall_count;
+
+    /* Window-desync detection: consecutive incoming packets rejected as "too late"
+     * (see RAOP_LATE_REJECT_LIMIT) */
+    int late_reject_count;
 
     /* RTP buffer entries */
     raop_buffer_entry_t entries[RAOP_BUFFER_LENGTH];
@@ -195,10 +219,20 @@ raop_buffer_enqueue(raop_buffer_t *raop_buffer, unsigned char *data, unsigned sh
         seqnum = raop_buffer->first_seqnum;
     }
 
-    /* If this packet is too late, just skip it */
+    /* If this packet is too late, just skip it -- unless "too late" packets are all that's
+     * arriving anymore, in which case the buffer window is desynced from the live stream
+     * (e.g. a FLUSH set first_seqnum to a next_seq the sender never continued from) and
+     * playback would stay silent forever; reset the window and restart at this packet. */
     if (!raop_buffer->is_empty && seqnum_cmp(seqnum, raop_buffer->first_seqnum) < 0) {
-        return 0;
+        if (++raop_buffer->late_reject_count <= RAOP_LATE_REJECT_LIMIT) {
+            return 0;
+        }
+        logger_log(raop_buffer->logger, LOGGER_INFO,
+                   "raop_buffer: window desynced (%d consecutive too-late packets, window at %u), restarting at seqnum %u",
+                   raop_buffer->late_reject_count, raop_buffer->first_seqnum, seqnum);
+        raop_buffer_flush(raop_buffer, -1);
     }
+    raop_buffer->late_reject_count = 0;
 
     /* Check that there is always space in the buffer, otherwise flush */
     if (seqnum_cmp(seqnum, raop_buffer->first_seqnum + RAOP_BUFFER_LENGTH) >= 0) {
@@ -305,7 +339,29 @@ void raop_buffer_handle_resends(raop_buffer_t *raop_buffer, raop_resend_cb_t res
 	    count++;
         }
         if (count){
+            /* If the head of the buffer has been stuck on this same missing seqnum for many
+             * rounds, the sender no longer has the packet (flushed on a track skip, or it only
+             * answers with empty resend responses) -- skip the whole leading run of holes so
+             * playback resumes from the next packet we actually have, instead of stalling
+             * until the buffer window overruns. */
+            if (raop_buffer->stall_count > 0 &&
+                seqnum_cmp(raop_buffer->first_seqnum, raop_buffer->stalled_seqnum) == 0) {
+                if (++raop_buffer->stall_count > RAOP_RESEND_STALL_LIMIT) {
+                    logger_log(raop_buffer->logger, LOGGER_INFO,
+                               "raop_buffer: giving up on %u unrecoverable audio packet(s), skipping seqnums %u-%u",
+                               count, raop_buffer->first_seqnum,
+                               (unsigned short) (raop_buffer->first_seqnum + count - 1));
+                    raop_buffer->first_seqnum += count;
+                    raop_buffer->stall_count = 0;
+                    return;
+                }
+            } else {
+                raop_buffer->stalled_seqnum = raop_buffer->first_seqnum;
+                raop_buffer->stall_count = 1;
+            }
             resend_cb(opaque, raop_buffer->first_seqnum, count);
+        } else {
+            raop_buffer->stall_count = 0;
         }
     }
 }
@@ -327,4 +383,6 @@ void raop_buffer_flush(raop_buffer_t *raop_buffer, int next_seq) {
         raop_buffer->first_seqnum = next_seq;
         raop_buffer->last_seqnum = next_seq - 1;
     }
+    raop_buffer->stall_count = 0;
+    raop_buffer->late_reject_count = 0;
 }
