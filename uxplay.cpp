@@ -95,6 +95,7 @@
 static const char *appname = DEFAULT_NAME;
 static std::string server_name = appname;
 static bool server_name_is_utf8 = false;
+static std::string last_device_name = "AirPlay Device";
 static dnssd_t *dnssd = NULL;
 static raop_t *raop = NULL;
 static logger_t *render_logger = NULL;
@@ -2252,7 +2253,7 @@ extern "C" int video_set_codec(void *cls, raop_ntp_t *ntp, video_codec_t codec) 
             multi_client_release_slot(ntp);
             return -1;
         }
-        printf("CLIENT_CONNECTED slot=%d video_port=%u\n", slot, port);
+        printf("CLIENT_CONNECTED slot=%d video_port=%u device_name=%s\n", slot, port, last_device_name.c_str());
         fflush(stdout);
         return 0;
     }
@@ -2371,6 +2372,11 @@ extern "C" void conn_reset (void *cls, raop_ntp_t *ntp, int reason) {
 
 extern "C" void report_client_request(void *cls, char *deviceid, char * model, char *name, bool * admit) {
     LOGI("connection request from %s (%s) with deviceID = %s\n", name, model, deviceid);
+    if (name) {
+        last_device_name = name;
+    } else {
+        last_device_name = "AirPlay Device";
+    }
     if (restrict_clients) {
         *admit = check_client(deviceid);
         if (*admit == false) {
