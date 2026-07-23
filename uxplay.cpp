@@ -96,15 +96,6 @@
 static const char *appname = DEFAULT_NAME;
 static std::string server_name = appname;
 static bool server_name_is_utf8 = false;
-// report_client_request() writes this on the shared httpd_thread; video_set_codec() reads
-// it on each client's own dedicated raop_rtp_mirror_thread -- guard against the concurrent
-// unsynchronized std::string access (was UB: possible torn read/crash, see
-// screenmirror-uxplay-multiclient memory 2026-07-23). Note this still doesn't fix
-// cross-client name misattribution if two SETUPs interleave with their video_set_codec calls --
-// report_client_request has no raop_ntp_t* to key off (it fires before the connection's ntp
-// exists), so a correct per-client fix needs deeper raop.c changes, not just locking.
-static std::mutex last_device_name_mutex;
-static std::string last_device_name = "AirPlay Device";
 static dnssd_t *dnssd = NULL;
 static raop_t *raop = NULL;
 static logger_t *render_logger = NULL;
@@ -2147,6 +2138,7 @@ static bool check_blocked_client(char *deviceid) {
 // mutex (see screenmirror-uxplay-multiclient memory 2026-07-23).
 static std::mutex multi_client_slot_mutex;
 static std::map<raop_ntp_t*, int> multi_client_slot_by_ntp;
+static std::map<raop_ntp_t*, std::string> multi_client_name_by_ntp;
 static bool multi_client_slot_busy[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = { false };
 
 static int multi_client_alloc_slot(raop_ntp_t *ntp) {
@@ -2181,6 +2173,9 @@ static void multi_client_release_slot(raop_ntp_t *ntp) {
     int slot;
     {
         std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
+        /* unconditional: a client that never reached video_set_codec (e.g. rejected for
+         * sending H265) still got a name recorded and would otherwise leak this entry */
+        multi_client_name_by_ntp.erase(ntp);
         auto it = multi_client_slot_by_ntp.find(ntp);
         if (it == multi_client_slot_by_ntp.end()) {
             return;
@@ -2195,6 +2190,17 @@ static void multi_client_release_slot(raop_ntp_t *ntp) {
     audio_renderer_multi_client_stop(slot);
     printf("CLIENT_DISCONNECTED slot=%d\n", slot);
     fflush(stdout);
+}
+
+// Called from raop_handler_setup once conn->raop_ntp exists (right after
+// report_client_request, same SETUP request, before any per-connection thread can start)
+// so the name is always populated before video_set_codec's mirror thread can read it --
+// fixes the cross-client misattribution a last-write-wins global couldn't.
+extern "C" void multi_client_set_name(void *cls, raop_ntp_t *ntp, const char *name) {
+    if (multi_client_max > 0 && ntp) {
+        std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
+        multi_client_name_by_ntp[ntp] = (name && name[0]) ? name : "AirPlay Device";
+    }
 }
 
 // Server callbacks
@@ -2284,10 +2290,13 @@ extern "C" int video_set_codec(void *cls, raop_ntp_t *ntp, video_codec_t codec) 
             multi_client_release_slot(ntp);
             return -1;
         }
-        std::string device_name_copy;
+        std::string device_name_copy = "AirPlay Device";
         {
-            std::lock_guard<std::mutex> lock(last_device_name_mutex);
-            device_name_copy = last_device_name;
+            std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
+            auto name_it = multi_client_name_by_ntp.find(ntp);
+            if (name_it != multi_client_name_by_ntp.end()) {
+                device_name_copy = name_it->second;
+            }
         }
         printf("CLIENT_CONNECTED slot=%d video_port=%u device_name=%s\n", slot, port, device_name_copy.c_str());
         fflush(stdout);
@@ -2408,10 +2417,6 @@ extern "C" void conn_reset (void *cls, raop_ntp_t *ntp, int reason) {
 
 extern "C" void report_client_request(void *cls, char *deviceid, char * model, char *name, bool * admit) {
     LOGI("connection request from %s (%s) with deviceID = %s\n", name, model, deviceid);
-    {
-        std::lock_guard<std::mutex> lock(last_device_name_mutex);
-        last_device_name = name ? name : "AirPlay Device";
-    }
     if (restrict_clients) {
         *admit = check_client(deviceid);
         if (*admit == false) {
@@ -2916,6 +2921,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.audio_stop_coverart_rendering = audio_stop_coverart_rendering;
     raop_cbs.audio_set_progress = audio_set_progress;
     raop_cbs.report_client_request = report_client_request;
+    raop_cbs.multi_client_set_name = multi_client_set_name;
     raop_cbs.display_pin = display_pin;
     raop_cbs.register_client = register_client;
     raop_cbs.check_register = check_register;

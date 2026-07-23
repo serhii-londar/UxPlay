@@ -770,10 +770,10 @@ raop_handler_setup(raop_conn_t *conn,
         deviceID = NULL;
         plist_mem_free(model);
         model = NULL;
-        plist_mem_free(name);
-        name = NULL;
         if (admit_client == false) {
             /* client is not authorized to connect */
+            plist_mem_free(name);
+            name = NULL;
             plist_free(res_root_node);
             plist_free(req_root_node);
             return;
@@ -927,6 +927,14 @@ raop_handler_setup(raop_conn_t *conn,
                                        remote, conn->remotelen, aeskey, aesiv);
         conn->raop_rtp_mirror = raop_rtp_mirror_init(raop->logger, &raop->callbacks,
                                                      conn->raop_ntp, remote, conn->remotelen, aeskey);
+
+        /* now that conn->raop_ntp exists, hand the name off keyed by ntp instead of the
+         * racy last-write-wins global report_client_request used to rely on */
+        if (raop->callbacks.multi_client_set_name) {
+            raop->callbacks.multi_client_set_name(raop->callbacks.cls, conn->raop_ntp, name);
+        }
+        plist_mem_free(name);
+        name = NULL;
 
         /* the event port is not used in mirror mode or audio mode */
         unsigned short event_port = 0;

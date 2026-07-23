@@ -101,6 +101,12 @@ struct raop_callbacks_s {
     void  (*video_report_size)(void *cls, raop_ntp_t *ntp, float *width_source, float *height_source, float *width, float *height);
     void  (*mirror_video_running)(void *cls, raop_ntp_t *ntp, bool is_running);
     void  (*report_client_request) (void *cls, char *deviceid, char *model, char *name, bool *admit);
+    /* Fires once conn->raop_ntp exists for this connection (shortly after
+     * report_client_request, within the same SETUP request) so multi-client mode can
+     * associate the connection's display name with its eventual slot without racing
+     * report_client_request -- which has no ntp yet at the point it fires -- against the
+     * per-connection thread that later resolves the slot from ntp. */
+    void  (*multi_client_set_name) (void *cls, raop_ntp_t *ntp, const char *name);
     void  (*display_pin) (void *cls, char * pin);
     void  (*register_client) (void *cls, const char *device_id, const char *pk_str, const char *name);
     bool  (*check_register) (void *cls, const char *pk_str);
