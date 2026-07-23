@@ -936,6 +936,13 @@ raop_handler_setup(raop_conn_t *conn,
         plist_mem_free(name);
         name = NULL;
 
+        /* Active-Remote/DACP-ID are captured earlier (see the have_active_remote block in
+         * raop.c) on whichever request first carried them, typically well before SETUP --
+         * stashed on conn until raop_ntp exists here, same ordering fix as the name above. */
+        if (raop->callbacks.multi_client_set_dacp && conn->dacp_id && conn->active_remote_id) {
+            raop->callbacks.multi_client_set_dacp(raop->callbacks.cls, conn->raop_ntp, conn->dacp_id, conn->active_remote_id);
+        }
+
         /* the event port is not used in mirror mode or audio mode */
         unsigned short event_port = 0;
         plist_t res_event_port_node = plist_new_uint(event_port);
@@ -1288,7 +1295,7 @@ raop_handler_teardown(raop_conn_t *conn,
         }
     }
     plist_free(req_root_node);
-    logger_log(raop->logger, LOGGER_DEBUG, "TEARDOWN request,  96=%d, 110=%d", teardown_96, teardown_110);
+    logger_log(raop->logger, LOGGER_INFO, "TEARDOWN request,  96=%d, 110=%d", teardown_96, teardown_110);
 
     /* Connection: close tells the client this RTSP control connection is going away --
      * only true for the full teardown (neither flag set). A partial teardown (96 or 110

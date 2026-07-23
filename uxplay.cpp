@@ -29,6 +29,8 @@
 #include <vector>
 #include <map>
 #include <mutex>
+#include <thread>
+#include <iostream>
 #include <fstream>
 #include <sstream>
 #include <iterator>
@@ -202,6 +204,7 @@ static std::string track_album;
 static std::string coverart_artist;
 static std::string ble_filename = "";
 static std::string rtp_pipeline = "";
+static std::string rtp_pipeline_h265 = "";
 static std::string audio_rtp_pipeline = "";
 /* multi-client mirroring: off by default (0). See raop_set_multiclient() and the
  * "Multi-client mirroring" section near the server callbacks for the rest of it. */
@@ -1471,6 +1474,14 @@ static void parse_arguments (int argc, char *argv[]) {
           }
 	  rtp_pipeline.erase();
 	  rtp_pipeline.append(argv[++i]);
+	} else if (arg == "-vrtp265") {
+	  if (!option_has_value(i, argc, arg, argv[i+1])) {
+	    fprintf(stderr,"option \"-vrtp265\" must be followed by a pipeline for sending an h265 video stream:\n"
+		    "e.g., \"<rtph265pay options> ! udpsink host=127.0.0.1 port=5000\"\n");
+	    exit(1);
+          }
+	  rtp_pipeline_h265.erase();
+	  rtp_pipeline_h265.append(argv[++i]);
 	} else if (arg == "-artp") {
 	  if (!option_has_value(i, argc, arg, argv[i+1])) {
 	    fprintf(stderr,"option \"-artp\" must be followed by a pipeline for sending the audio stream:\n"
@@ -2139,6 +2150,8 @@ static bool check_blocked_client(char *deviceid) {
 static std::mutex multi_client_slot_mutex;
 static std::map<raop_ntp_t*, int> multi_client_slot_by_ntp;
 static std::map<raop_ntp_t*, std::string> multi_client_name_by_ntp;
+struct multi_client_dacp_info_t { std::string dacp_id; std::string active_remote; };
+static std::map<raop_ntp_t*, multi_client_dacp_info_t> multi_client_dacp_by_ntp;
 static bool multi_client_slot_busy[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = { false };
 
 static int multi_client_alloc_slot(raop_ntp_t *ntp) {
@@ -2167,6 +2180,53 @@ static int multi_client_lookup_slot(raop_ntp_t *ntp) {
     return (it != multi_client_slot_by_ntp.end()) ? it->second : -1;
 }
 
+// Reverse of the above: used only by multi_client_disconnect_slot(), which is handed a
+// slot number (the receiver UI's identifier) rather than the ntp the map is keyed by.
+static raop_ntp_t *multi_client_ntp_for_slot(int slot) {
+    std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
+    for (const auto &entry : multi_client_slot_by_ntp) {
+        if (entry.second == slot) {
+            return entry.first;
+        }
+    }
+    return nullptr;
+}
+
+// Entry point for the receiver-initiated "disconnect this client" command (see
+// stdin_command_thread_func()): forces the real AirPlay socket to that device closed so
+// the device itself notices and stops mirroring, instead of only releasing local
+// rendering resources. A miss here is a normal race, not an error -- the client may have
+// disconnected on its own between the UI action and this call reaching the slot map.
+static void multi_client_disconnect_slot(int slot) {
+    raop_ntp_t *ntp = multi_client_ntp_for_slot(slot);
+    if (!ntp) {
+        LOGI("multi-client: disconnect request for slot %d has no active connection, ignoring", slot);
+        return;
+    }
+    LOGI("multi-client: disconnecting slot %d by receiver request", slot);
+    raop_remove_connection(raop, ntp);
+}
+
+// Receiver-initiated per-client disconnect: the macOS app has no other way to reach into
+// this shared multi-client process and force-close one specific client's real AirPlay
+// session (see multi_client_disconnect_slot() above) -- everything else here is either
+// global (SIGTERM/SIGINT) or reactive to the device's own RTSP requests. Reads newline-
+// terminated "DISCONNECT <slot>" commands from stdin, symmetric with how CLIENT_CONNECTED/
+// CLIENT_DISCONNECTED already flow the other direction over stdout. Only started in
+// multi-client mode (see main()); left running detached since the process exiting is the
+// only way this thread ever needs to end.
+static void stdin_command_thread_func() {
+    std::string line;
+    while (std::getline(std::cin, line)) {
+        std::istringstream iss(line);
+        std::string cmd;
+        int slot;
+        if ((iss >> cmd >> slot) && cmd == "DISCONNECT") {
+            multi_client_disconnect_slot(slot);
+        }
+    }
+}
+
 /* Safe to call more than once for the same ntp (video_reset and conn_destroy can both
  * fire for one connection's teardown) -- second call is a no-op since the map entry is gone. */
 static void multi_client_release_slot(raop_ntp_t *ntp) {
@@ -2176,6 +2236,7 @@ static void multi_client_release_slot(raop_ntp_t *ntp) {
         /* unconditional: a client that never reached video_set_codec (e.g. rejected for
          * sending H265) still got a name recorded and would otherwise leak this entry */
         multi_client_name_by_ntp.erase(ntp);
+        multi_client_dacp_by_ntp.erase(ntp);
         auto it = multi_client_slot_by_ntp.find(ntp);
         if (it == multi_client_slot_by_ntp.end()) {
             return;
@@ -2200,6 +2261,14 @@ extern "C" void multi_client_set_name(void *cls, raop_ntp_t *ntp, const char *na
     if (multi_client_max > 0 && ntp) {
         std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
         multi_client_name_by_ntp[ntp] = (name && name[0]) ? name : "AirPlay Device";
+    }
+}
+
+// Same wiring as multi_client_set_name above, for the DACP remote-control identity.
+extern "C" void multi_client_set_dacp(void *cls, raop_ntp_t *ntp, const char *dacp_id, const char *active_remote) {
+    if (multi_client_max > 0 && ntp && dacp_id && dacp_id[0] && active_remote && active_remote[0]) {
+        std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
+        multi_client_dacp_by_ntp[ntp] = { dacp_id, active_remote };
     }
 }
 
@@ -2277,8 +2346,8 @@ extern "C" void video_reset(void *cls, raop_ntp_t *ntp, reset_type_t type) {
 extern "C" int video_set_codec(void *cls, raop_ntp_t *ntp, video_codec_t codec) {
     bool video_is_h265 = (codec == VIDEO_CODEC_H265);
     if (multi_client_max > 0 && ntp) {
-        if (video_is_h265) {
-            LOGE("multi-client mode only supports H264; client sent H265, dropping connection");
+        if (video_is_h265 && rtp_pipeline_h265.empty()) {
+            LOGE("multi-client mode: client sent H265 but no -vrtp265 pipeline was configured, dropping connection");
             return -1;
         }
         int slot = multi_client_alloc_slot(ntp);
@@ -2286,19 +2355,31 @@ extern "C" int video_set_codec(void *cls, raop_ntp_t *ntp, video_codec_t codec) 
             return -1;
         }
         unsigned short port = multi_client_base_port + (unsigned short) (slot * 2);
-        if (video_renderer_multi_client_start(slot, video_parser.c_str(), rtp_pipeline.c_str(), port, video_sync) < 0) {
+        const char *parser = video_is_h265 ? "h265parse" : video_parser.c_str();
+        const char *pipeline_template = video_is_h265 ? rtp_pipeline_h265.c_str() : rtp_pipeline.c_str();
+        if (video_renderer_multi_client_start(slot, parser, pipeline_template, port, video_sync, video_is_h265) < 0) {
             multi_client_release_slot(ntp);
             return -1;
         }
         std::string device_name_copy = "AirPlay Device";
+        std::string dacp_id_copy, active_remote_copy;
         {
             std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
             auto name_it = multi_client_name_by_ntp.find(ntp);
             if (name_it != multi_client_name_by_ntp.end()) {
                 device_name_copy = name_it->second;
             }
+            auto dacp_it = multi_client_dacp_by_ntp.find(ntp);
+            if (dacp_it != multi_client_dacp_by_ntp.end()) {
+                dacp_id_copy = dacp_it->second.dacp_id;
+                active_remote_copy = dacp_it->second.active_remote;
+            }
         }
-        printf("CLIENT_CONNECTED slot=%d video_port=%u device_name=%s\n", slot, port, device_name_copy.c_str());
+        /* dacp_id/active_remote are plain tokens (no spaces) so they're safe as fixed-width
+         * space-delimited fields; device_name must stay last since it can contain spaces and
+         * the Swift-side parser reads it as "rest of line" (see processStdoutChunk). */
+        printf("CLIENT_CONNECTED slot=%d video_port=%u dacp_id=%s active_remote=%s device_name=%s\n",
+               slot, port, dacp_id_copy.c_str(), active_remote_copy.c_str(), device_name_copy.c_str());
         fflush(stdout);
         return 0;
     }
@@ -2677,6 +2758,7 @@ extern "C" void audio_reset(void *cls, raop_ntp_t *ntp) {
     if (multi_client_max > 0 && ntp) {
         int slot = multi_client_lookup_slot(ntp);
         if (slot >= 0) {
+            LOGI("audio_reset: partial audio TEARDOWN, tearing down slot %d's audio pipeline", slot);
             audio_renderer_multi_client_stop(slot);
         }
     }
@@ -2923,6 +3005,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.audio_set_progress = audio_set_progress;
     raop_cbs.report_client_request = report_client_request;
     raop_cbs.multi_client_set_name = multi_client_set_name;
+    raop_cbs.multi_client_set_dacp = multi_client_set_dacp;
     raop_cbs.display_pin = display_pin;
     raop_cbs.register_client = register_client;
     raop_cbs.check_register = check_register;
@@ -2957,6 +3040,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
         raop_set_multiclient(raop, multi_client_max);
         LOGI("multi-client mode: up to %d concurrent clients, loopback ports from %u",
              multi_client_max, multi_client_base_port);
+        std::thread(stdin_command_thread_func).detach();
     }
 
     /* write desired display pixel width, pixel height, refresh_rate, max_fps, overscanned.  */

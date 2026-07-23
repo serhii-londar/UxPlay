@@ -717,7 +717,7 @@ void video_renderer_multi_client_init(logger_t *render_logger) {
 }
 
 int video_renderer_multi_client_start(int slot, const char *parser, const char *rtp_pipeline_template,
-                                      unsigned short port, bool video_sync_enabled) {
+                                      unsigned short port, bool video_sync_enabled, bool video_is_h265) {
     if (slot < 0 || slot >= VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS) {
         return -1;
     }
@@ -738,7 +738,7 @@ int video_renderer_multi_client_start(int slot, const char *parser, const char *
 
     GString *launch = g_string_new("appsrc name=video_source ! queue ! ");
     g_string_append(launch, parser);
-    g_string_append(launch, " ! rtph264pay ");
+    g_string_append(launch, video_is_h265 ? " ! rtph265pay " : " ! rtph264pay ");
     g_string_append(launch, pipeline_str->str);
     g_string_free(pipeline_str, TRUE);
 
@@ -766,7 +766,7 @@ int video_renderer_multi_client_start(int slot, const char *parser, const char *
         s->pipeline = NULL;
         return -1;
     }
-    GstCaps *caps = gst_caps_from_string(h264_caps);
+    GstCaps *caps = gst_caps_from_string(video_is_h265 ? h265_caps : h264_caps);
     g_object_set(s->appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
     gst_caps_unref(caps);
 

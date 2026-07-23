@@ -356,6 +356,24 @@ httpd_remove_connections_by_type(httpd_t *httpd, connection_type_t type) {
     }
 }
 
+/* Marks a single connection (identified the same way as httpd_get_connection_socket())
+ * for removal on the httpd thread's next select() loop pass. Safe to call from any
+ * thread: this only sets a flag that httpd_thread polls itself -- the actual socket
+ * close and conn_destroy callback always run on httpd_thread, never here. */
+void
+httpd_remove_connection_by_user_data(httpd_t *httpd, void *user_data) {
+    for (int i = 0; i < httpd->max_connections; i++) {
+        http_connection_t *connection = &httpd->connections[i];
+        if (!connection->connected) {
+            continue;
+        }
+        if (connection->user_data == user_data) {
+            connection->pending_remove = 1;
+            return;
+        }
+    }
+}
+
 static THREAD_RETVAL
 httpd_thread(void *arg)
 {

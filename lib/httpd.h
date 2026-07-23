@@ -40,6 +40,7 @@ typedef struct httpd_callbacks_s httpd_callbacks_t;
 bool httpd_nohold(httpd_t *httpd);
 void httpd_remove_known_connections(httpd_t *httpd);
 void httpd_remove_connections_by_type(httpd_t *httpd, connection_type_t type);
+void httpd_remove_connection_by_user_data(httpd_t *httpd, void *user_data);
 
 int httpd_set_connection_type (httpd_t *http, void *user_data, connection_type_t type);
 int httpd_count_connection_type (httpd_t *http, connection_type_t type);

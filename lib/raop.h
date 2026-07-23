@@ -107,6 +107,11 @@ struct raop_callbacks_s {
      * report_client_request -- which has no ntp yet at the point it fires -- against the
      * per-connection thread that later resolves the slot from ntp. */
     void  (*multi_client_set_name) (void *cls, raop_ntp_t *ntp, const char *name);
+    /* same rationale as multi_client_set_name above, for the DACP remote-control identity
+     * (Active-Remote token + DACP-ID) each connection's requests carry -- lets multi-client
+     * mode target a specific connected device's Now Playing session instead of only ever
+     * supporting the single global export_dacp file below. */
+    void  (*multi_client_set_dacp) (void *cls, raop_ntp_t *ntp, const char *dacp_id, const char *active_remote);
     void  (*display_pin) (void *cls, char * pin);
     void  (*register_client) (void *cls, const char *device_id, const char *pk_str, const char *name);
     bool  (*check_register) (void *cls, const char *pk_str);
@@ -150,6 +155,7 @@ RAOP_API void raop_stop_httpd(raop_t *raop);
 RAOP_API void raop_set_dnssd(raop_t *raop, dnssd_t *dnssd);
 RAOP_API void raop_destroy(raop_t *raop);
 RAOP_API void raop_remove_known_connections(raop_t * raop);
+RAOP_API void raop_remove_connection(raop_t *raop, raop_ntp_t *ntp);
 RAOP_API void raop_remove_hls_connections(raop_t * raop);
 RAOP_API void raop_destroy_airplay_video(raop_t *raop, int id);
 RAOP_API void raop_playlist_remove(raop_t *raop, void *airplay_video, float position);

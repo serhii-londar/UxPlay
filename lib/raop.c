@@ -123,6 +123,8 @@ struct raop_conn_s {
     char *client_session_id;
     bool authenticated;
     bool have_active_remote;
+    char *dacp_id;
+    char *active_remote_id;
 };
 typedef struct raop_conn_s raop_conn_t;
 
@@ -182,7 +184,9 @@ conn_init(void *opaque, unsigned char *local, int locallen, unsigned char *remot
     conn->authenticated = false;
 
     conn->have_active_remote = false;
-    
+    conn->dacp_id = NULL;
+    conn->active_remote_id = NULL;
+
     if (raop->callbacks.conn_init) {
         raop->callbacks.conn_init(raop->callbacks.cls);
     }
@@ -360,8 +364,13 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         const char *active_remote = http_request_get_header(request, "Active-Remote");
         if (active_remote) {
             conn->have_active_remote = true;
+            const char *dacp_id = http_request_get_header(request, "DACP-ID");
+            /* stashed on conn (rather than only handed to the singleton export_dacp callback
+             * below) so multi-client mode can later associate it with this connection's ntp
+             * once raop_ntp exists -- see multi_client_set_dacp in raop_handler_setup. */
+            conn->active_remote_id = strdup(active_remote);
+            conn->dacp_id = dacp_id ? strdup(dacp_id) : NULL;
             if (raop->callbacks.export_dacp) {
-                const char *dacp_id = http_request_get_header(request, "DACP-ID");
                 raop->callbacks.export_dacp(raop->callbacks.cls, active_remote, dacp_id);
             }
         }
@@ -598,6 +607,8 @@ conn_destroy(void *ptr) {
     if (conn->client_session_id) {
         free(conn->client_session_id);
     }
+    free(conn->dacp_id);
+    free(conn->active_remote_id);
 
     free(conn);
 }
@@ -879,6 +890,25 @@ raop_stop_httpd(raop_t *raop) {
 
 void raop_remove_known_connections(raop_t * raop) {
     httpd_remove_known_connections(raop->httpd);
+}
+
+/* Force-closes the single RAOP connection identified by ntp (as used by multi-client mode
+ * to key its per-client slot map), so a receiver-initiated disconnect actually drops the
+ * real AirPlay socket to that device instead of only stopping local rendering. This runs
+ * conn_destroy the same way any other disconnect does ("in case TEARDOWN was not called"),
+ * so it's a normal ungraceful-close path, not a special case. */
+void raop_remove_connection(raop_t *raop, raop_ntp_t *ntp) {
+    if (!ntp) {
+        return;
+    }
+    int count = httpd_count_connection_type(raop->httpd, CONNECTION_TYPE_RAOP);
+    for (int i = 1; i <= count; i++) {
+        raop_conn_t *conn = (raop_conn_t *) httpd_get_connection_by_type(raop->httpd, CONNECTION_TYPE_RAOP, i);
+        if (conn && conn->raop_ntp == ntp) {
+            httpd_remove_connection_by_user_data(raop->httpd, conn);
+            return;
+        }
+    }
 }
 
 void raop_remove_hls_connections(raop_t * raop) {
