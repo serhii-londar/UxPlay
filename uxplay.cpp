@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <vector>
 #include <map>
+#include <mutex>
 #include <fstream>
 #include <sstream>
 #include <iterator>
@@ -95,6 +96,14 @@
 static const char *appname = DEFAULT_NAME;
 static std::string server_name = appname;
 static bool server_name_is_utf8 = false;
+// report_client_request() writes this on the shared httpd_thread; video_set_codec() reads
+// it on each client's own dedicated raop_rtp_mirror_thread -- guard against the concurrent
+// unsynchronized std::string access (was UB: possible torn read/crash, see
+// screenmirror-uxplay-multiclient memory 2026-07-23). Note this still doesn't fix
+// cross-client name misattribution if two SETUPs interleave with their video_set_codec calls --
+// report_client_request has no raop_ntp_t* to key off (it fires before the connection's ntp
+// exists), so a correct per-client fix needs deeper raop.c changes, not just locking.
+static std::mutex last_device_name_mutex;
 static std::string last_device_name = "AirPlay Device";
 static dnssd_t *dnssd = NULL;
 static raop_t *raop = NULL;
@@ -2131,10 +2140,17 @@ static bool check_blocked_client(char *deviceid) {
 // When on, each concurrent AirPlay connection gets its own slot (0..multi_client_max-1),
 // each slot its own loopback port and its own GStreamer pipeline in video_renderer.c,
 // instead of every connection sharing the single process-wide renderer.
+// Hit from 3 different thread contexts per client (httpd_thread via conn_destroy/conn_reset,
+// the per-client audio raop_rtp_thread, the per-client video raop_rtp_mirror_thread), with
+// lookups on every audio/video packet and insert/erase on connect/disconnect -- std::map isn't
+// safe for concurrent read+write without external locking, so all access goes through this
+// mutex (see screenmirror-uxplay-multiclient memory 2026-07-23).
+static std::mutex multi_client_slot_mutex;
 static std::map<raop_ntp_t*, int> multi_client_slot_by_ntp;
 static bool multi_client_slot_busy[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = { false };
 
 static int multi_client_alloc_slot(raop_ntp_t *ntp) {
+    std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
     auto it = multi_client_slot_by_ntp.find(ntp);
     if (it != multi_client_slot_by_ntp.end()) {
         return it->second;
@@ -2150,20 +2166,35 @@ static int multi_client_alloc_slot(raop_ntp_t *ntp) {
     return -1;
 }
 
+// Read-only lookup for the call sites that only need to know a client's already-allocated
+// slot (audio_process/video_process/audio_reset) -- same mutex as alloc/release since it's
+// the same map.
+static int multi_client_lookup_slot(raop_ntp_t *ntp) {
+    std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
+    auto it = multi_client_slot_by_ntp.find(ntp);
+    return (it != multi_client_slot_by_ntp.end()) ? it->second : -1;
+}
+
 /* Safe to call more than once for the same ntp (video_reset and conn_destroy can both
  * fire for one connection's teardown) -- second call is a no-op since the map entry is gone. */
 static void multi_client_release_slot(raop_ntp_t *ntp) {
-    auto it = multi_client_slot_by_ntp.find(ntp);
-    if (it == multi_client_slot_by_ntp.end()) {
-        return;
+    int slot;
+    {
+        std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
+        auto it = multi_client_slot_by_ntp.find(ntp);
+        if (it == multi_client_slot_by_ntp.end()) {
+            return;
+        }
+        slot = it->second;
+        multi_client_slot_busy[slot] = false;
+        multi_client_slot_by_ntp.erase(it);
     }
-    int slot = it->second;
+    // Renderer teardown can take a while (GStreamer pipeline stop) -- do it outside the lock
+    // so it doesn't block other clients' concurrent alloc/release/lookup calls.
     video_renderer_multi_client_stop(slot);
     audio_renderer_multi_client_stop(slot);
     printf("CLIENT_DISCONNECTED slot=%d\n", slot);
     fflush(stdout);
-    multi_client_slot_busy[slot] = false;
-    multi_client_slot_by_ntp.erase(it);
 }
 
 // Server callbacks
@@ -2253,7 +2284,12 @@ extern "C" int video_set_codec(void *cls, raop_ntp_t *ntp, video_codec_t codec) 
             multi_client_release_slot(ntp);
             return -1;
         }
-        printf("CLIENT_CONNECTED slot=%d video_port=%u device_name=%s\n", slot, port, last_device_name.c_str());
+        std::string device_name_copy;
+        {
+            std::lock_guard<std::mutex> lock(last_device_name_mutex);
+            device_name_copy = last_device_name;
+        }
+        printf("CLIENT_CONNECTED slot=%d video_port=%u device_name=%s\n", slot, port, device_name_copy.c_str());
         fflush(stdout);
         return 0;
     }
@@ -2372,10 +2408,9 @@ extern "C" void conn_reset (void *cls, raop_ntp_t *ntp, int reason) {
 
 extern "C" void report_client_request(void *cls, char *deviceid, char * model, char *name, bool * admit) {
     LOGI("connection request from %s (%s) with deviceID = %s\n", name, model, deviceid);
-    if (name) {
-        last_device_name = name;
-    } else {
-        last_device_name = "AirPlay Device";
+    {
+        std::lock_guard<std::mutex> lock(last_device_name_mutex);
+        last_device_name = name ? name : "AirPlay Device";
     }
     if (restrict_clients) {
         *admit = check_client(deviceid);
@@ -2398,8 +2433,8 @@ extern "C" void report_client_request(void *cls, char *deviceid, char * model, c
 
 extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *data) {
     if (multi_client_max > 0 && ntp) {
-        auto it = multi_client_slot_by_ntp.find(ntp);
-        if (it == multi_client_slot_by_ntp.end()) {
+        int slot = multi_client_lookup_slot(ntp);
+        if (slot < 0) {
             /* audio_get_format (which allocates the slot) hasn't run yet for this connection */
             return;
         }
@@ -2408,7 +2443,7 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
             remote_clock_offset = local_time - data->ntp_time_remote;
         }
         data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
-        audio_renderer_multi_client_push(it->second, data->data, data->data_len, data->ntp_time_remote);
+        audio_renderer_multi_client_push(slot, data->data, data->data_len, data->ntp_time_remote);
         return;
     }
     if (dump_audio) {
@@ -2447,8 +2482,8 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
 
 extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *data) {
     if (multi_client_max > 0 && ntp) {
-        auto it = multi_client_slot_by_ntp.find(ntp);
-        if (it == multi_client_slot_by_ntp.end()) {
+        int slot = multi_client_lookup_slot(ntp);
+        if (slot < 0) {
             /* video_set_codec (which allocates the slot) hasn't run yet for this connection */
             return;
         }
@@ -2457,7 +2492,7 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
             remote_clock_offset = local_time - data->ntp_time_remote;
         }
         data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
-        video_renderer_multi_client_push(it->second, data->data, data->data_len, data->ntp_time_remote);
+        video_renderer_multi_client_push(slot, data->data, data->data_len, data->ntp_time_remote);
         return;
     }
     if (dump_video) {
@@ -2634,9 +2669,9 @@ extern "C" void audio_get_format (void *cls, raop_ntp_t *ntp, unsigned char *ct,
  * same codec" no-op against a pipeline TEARDOWN already stopped feeding. */
 extern "C" void audio_reset(void *cls, raop_ntp_t *ntp) {
     if (multi_client_max > 0 && ntp) {
-        auto it = multi_client_slot_by_ntp.find(ntp);
-        if (it != multi_client_slot_by_ntp.end()) {
-            audio_renderer_multi_client_stop(it->second);
+        int slot = multi_client_lookup_slot(ntp);
+        if (slot >= 0) {
+            audio_renderer_multi_client_stop(slot);
         }
     }
 }
