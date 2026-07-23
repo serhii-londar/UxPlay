@@ -85,6 +85,8 @@ int video_renderer_multi_client_start(int slot, const char *parser, const char *
                                       unsigned short port, bool video_sync_enabled);
 void video_renderer_multi_client_push(int slot, unsigned char *data, int data_len, uint64_t ntp_time);
 void video_renderer_multi_client_stop(int slot);
+
+void video_renderer_hls_set_volume(double volume);
 #ifdef __cplusplus
 }
 #endif

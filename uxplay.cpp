@@ -2619,6 +2619,7 @@ extern "C" void audio_set_volume (void *cls, float volume) {
         gst_volume = pow(10.0, 0.05*db);
     }
     audio_renderer_set_volume(gst_volume);
+    video_renderer_hls_set_volume(gst_volume);
 }
 
 extern "C" void audio_get_format (void *cls, raop_ntp_t *ntp, unsigned char *ct, unsigned short *spf, bool *usingScreen, bool *isMedia, uint64_t *audioFormat) {
