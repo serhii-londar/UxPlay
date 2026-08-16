@@ -558,7 +558,7 @@ static gboolean feedback_callback(gpointer loop) {
             g_main_loop_quit((GMainLoop *) loop);
             return TRUE;
         } else if (missed_feedback > 2) {
-            LOGE("%3u seconds since last client feedback request (expected every two seconds); client may be offline", missed_feedback);
+            LOGD("%3u seconds since last client feedback request (expected every two seconds); client may be offline", missed_feedback);
         }
         missed_feedback++;
     } else {
@@ -2870,25 +2870,26 @@ extern "C" void audio_set_metadata(void *cls, const void *buffer, int buflen) {
 }
 
 extern "C" void register_client(void *cls, const char *device_id, const char *client_pk, const char *client_name) {
-    if (!registration_list) {
-      /* we are not maintaining a list of registered clients */
+    if (!client_pk) {
         return;
     }
-    LOGI("registered new client: %s DeviceID = %s PK = \n%s", client_name, device_id, client_pk);
-    registered_keys.push_back(client_pk);
-    if (strlen(pairing_register.c_str())) {
+    LOGI("registered new client: %s DeviceID = %s PK = %s", client_name ? client_name : "", device_id ? device_id : "", client_pk);
+    std::string pk = client_pk;
+    if (std::find(registered_keys.begin(), registered_keys.end(), pk) == registered_keys.end()) {
+        registered_keys.push_back(pk);
+    }
+    if (registration_list && strlen(pairing_register.c_str())) {
         FILE *fp = fopen(pairing_register.c_str(), "a");
         if (fp) {
-            fprintf(fp, "%s,%s,%s\n", client_pk, device_id, client_name);
+            fprintf(fp, "%s,%s,%s\n", client_pk, device_id ? device_id : "", client_name ? client_name : "");
             fclose(fp);
         }
     }
 }
 
 extern "C" bool check_register(void *cls, const char *client_pk) {
-    if (!registration_list) {
-        /* we are not maintaining a list of registered clients */
-        return true;
+    if (!client_pk) {
+        return false;
     }
     LOGD("check returning client's pairing registration");
     std::string pk = client_pk;
@@ -2896,7 +2897,7 @@ extern "C" bool check_register(void *cls, const char *client_pk) {
         LOGD("registration found: PK=%s", client_pk);
         return true;
     } else {
-        LOGE("returning client's pairing registration not found: PK=%s", client_pk);
+        LOGI("client's pairing registration not found (PIN prompt required): PK=%s", client_pk);
         return false;
     }
 }

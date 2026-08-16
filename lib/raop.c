@@ -127,6 +127,7 @@ struct raop_conn_s {
     bool have_active_remote;
     char *dacp_id;
     char *active_remote_id;
+    char *device_name;
 };
 typedef struct raop_conn_s raop_conn_t;
 
@@ -378,6 +379,16 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         }
     }
 
+    if (!conn->device_name) {
+        const char *dev_name = http_request_get_header(request, "X-Apple-Device-Name");
+        if (!dev_name) {
+            dev_name = http_request_get_header(request, "X-Apple-Client-Name");
+        }
+        if (dev_name && dev_name[0]) {
+            conn->device_name = strdup(dev_name);
+        }
+    }
+
     logger_log(raop->logger, LOGGER_DEBUG, "\n%s %s %s", method, url, protocol);
     if (!strcmp(url,"/playback-info")) {
         logger_debug = logger_debug_data;
@@ -611,6 +622,9 @@ conn_destroy(void *ptr) {
     }
     free(conn->dacp_id);
     free(conn->active_remote_id);
+    if (conn->device_name) {
+        free(conn->device_name);
+    }
 
     free(conn);
 }

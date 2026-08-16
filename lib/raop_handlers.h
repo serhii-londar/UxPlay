@@ -422,6 +422,15 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
             logger_log(raop->logger, LOGGER_DEBUG, "pair-pin-setup success\n");
         }
         pairing_session_set_setup_status(conn->session);
+        if (raop->callbacks.register_client) {
+            char *client_device_id = NULL;
+            char *client_pk = NULL;
+            get_pairing_session_client_data(conn->session, &client_device_id, &client_pk);
+            if (client_pk) {
+                raop->callbacks.register_client(raop->callbacks.cls, client_device_id, client_pk, client_device_id ? client_device_id : "iOS Device");
+                free(client_pk);
+            }
+        }
         plist_t res_root_node = plist_new_dict();
         plist_t res_epk_node = plist_new_data((const char *) epk, 32);
         plist_t res_authtag_node = plist_new_data((const char *) authtag, 16);
@@ -442,6 +451,11 @@ raop_handler_pairsetup(raop_conn_t *conn,
                        char **response_data, int *response_datalen)
 {
     raop_t *raop = conn->raop;
+    if (raop->use_pin) {
+        logger_log(raop->logger, LOGGER_ERR, "Legacy pair-setup attempted while PIN authentication is active");
+        http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
+        return;
+    }
     unsigned char public_key[ED25519_KEY_SIZE];
     //const char *data;
     int datalen = 0;
@@ -473,7 +487,6 @@ raop_handler_pairverify(raop_conn_t *conn,
     bool register_check = false;  
     if (pairing_session_check_handshake_status(conn->session)) {
         if (raop->use_pin) {
-            pairing_session_set_setup_status(conn->session);
             register_check = true;
         } else {
             return;
@@ -506,7 +519,7 @@ raop_handler_pairverify(raop_conn_t *conn,
             logger_log(raop->logger, LOGGER_ERR, "Error getting ED25519 signature");
         }
         if (register_check) {
-            bool registered_client = true;
+            bool registered_client = false;
             if (raop->callbacks.check_register) {
                 const unsigned char *pk = data + 4 + X25519_KEY_SIZE;
                 char *pk64 = NULL;
@@ -516,8 +529,11 @@ raop_handler_pairverify(raop_conn_t *conn,
             }
 
             if (!registered_client) {
+                logger_log(raop->logger, LOGGER_ERR, "pair-verify rejected: PIN pairing required");
+                http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
                 return;
             }
+            pairing_session_set_setup_status(conn->session);
         }
         *response_data = calloc(1, sizeof(public_key) + sizeof(signature));
         if (*response_data) {
@@ -754,6 +770,15 @@ raop_handler_setup(raop_conn_t *conn,
         plist_get_string_val(req_model_node, &model);  
         plist_t req_name_node = plist_dict_get_item(req_root_node, "name");
         plist_get_string_val(req_name_node, &name);  
+        if (!name || name[0] == '\0') {
+            if (conn->device_name && conn->device_name[0]) {
+                if (name) plist_mem_free(name);
+                name = strdup(conn->device_name);
+            } else if (model && model[0]) {
+                if (name) plist_mem_free(name);
+                name = strdup(model);
+            }
+        }
         if (raop->callbacks.report_client_request) {
             raop->callbacks.report_client_request(raop->callbacks.cls, deviceID, model, name, &admit_client);
         }
@@ -930,11 +955,14 @@ raop_handler_setup(raop_conn_t *conn,
 
         /* now that conn->raop_ntp exists, hand the name off keyed by ntp instead of the
          * racy last-write-wins global report_client_request used to rely on */
+        const char *effective_name = (name && name[0]) ? name : (conn->device_name && conn->device_name[0] ? conn->device_name : (model && model[0] ? model : "AirPlay Device"));
         if (raop->callbacks.multi_client_set_name) {
-            raop->callbacks.multi_client_set_name(raop->callbacks.cls, conn->raop_ntp, name);
+            raop->callbacks.multi_client_set_name(raop->callbacks.cls, conn->raop_ntp, effective_name);
         }
-        plist_mem_free(name);
-        name = NULL;
+        if (name) {
+            free(name);
+            name = NULL;
+        }
 
         /* Active-Remote/DACP-ID are captured earlier (see the have_active_remote block in
          * raop.c) on whichever request first carried them, typically well before SETUP --
