@@ -253,8 +253,7 @@ raop_buffer_enqueue(raop_buffer_t *raop_buffer, unsigned char *data, unsigned sh
 
     if (payload_size) {
         entry->payload_data = malloc(payload_size);
-        int decrypt_ret = raop_buffer_decrypt(raop_buffer, data, entry->payload_data, payload_size, &entry->payload_size);
-        assert(decrypt_ret >= 0);
+        raop_buffer_decrypt(raop_buffer, data, entry->payload_data, payload_size, &entry->payload_size);
         assert((int) entry->payload_size <= payload_size);
     } else {
         entry->payload_data = NULL;
