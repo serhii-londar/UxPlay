@@ -256,6 +256,7 @@ static void log(int level, const char* format, ...) {
     va_start(vargs, format);
     vprintf(format, vargs);
     printf("\n");
+    fflush(stdout);
     va_end(vargs);
 }
 
@@ -3199,6 +3200,7 @@ void real_main (int argc, char *argv[]) {
 #else
 int main (int argc, char *argv[]) {
 #endif
+    setbuf(stdout, NULL);
     std::vector<char> server_hw_addr;
     std::string config_file = "";
 
