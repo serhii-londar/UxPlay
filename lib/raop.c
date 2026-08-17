@@ -386,6 +386,17 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         }
         if (dev_name && dev_name[0]) {
             conn->device_name = strdup(dev_name);
+        } else {
+            char host[NI_MAXHOST] = { 0 };
+            if (getnameinfo((struct sockaddr *)&conn->remote, (socklen_t)conn->remotelen, host, sizeof(host), NULL, 0, NI_NAMEREQD) == 0 && host[0]) {
+                char *dot = strstr(host, ".local");
+                if (dot) *dot = '\0';
+                dot = strstr(host, ".lan");
+                if (dot) *dot = '\0';
+                if (host[0]) {
+                    conn->device_name = strdup(host);
+                }
+            }
         }
     }
 
