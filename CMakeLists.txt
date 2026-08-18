@@ -46,6 +46,17 @@ if( UNIX AND NOT APPLE )
   add_definitions( -DFULL_RANGE_RGB_FIX )
 else()
   set( CMAKE_INSTALL_RPATH_USE_LINK_PATH TRUE )
+  if( APPLE )
+    set( CMAKE_BUILD_WITH_INSTALL_RPATH TRUE )
+    set( CMAKE_INSTALL_RPATH
+      "@executable_path/../Frameworks"
+      "@loader_path/../Frameworks"
+      "/Library/Frameworks/GStreamer.framework/Libraries"
+      "/Library/Frameworks/GStreamer.framework/Versions/1.0/lib"
+      "/opt/homebrew/lib"
+      "/usr/local/lib"
+    )
+  endif()
 endif()
 
 if (USE_DNS_SD OR ( APPLE AND NOT USE_MDNS ))
