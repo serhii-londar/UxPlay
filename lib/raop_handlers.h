@@ -761,15 +761,21 @@ raop_handler_setup(raop_conn_t *conn,
             }
         }
 	
-        char* eiv = NULL;
-        uint64_t eiv_len = 0;
         char *model = NULL;
         char *name = NULL;
         bool admit_client = true;
         plist_t req_model_node = plist_dict_get_item(req_root_node, "model");
         plist_get_string_val(req_model_node, &model);  
+        if (!model) {
+            plist_t req_model_name_node = plist_dict_get_item(req_root_node, "modelName");
+            plist_get_string_val(req_model_name_node, &model);
+        }
         plist_t req_name_node = plist_dict_get_item(req_root_node, "name");
         plist_get_string_val(req_name_node, &name);  
+        if (!name) {
+            plist_t req_proc_name_node = plist_dict_get_item(req_root_node, "clientProcName");
+            plist_get_string_val(req_proc_name_node, &name);
+        }
         if (!name || name[0] == '\0') {
             if (conn->device_name && conn->device_name[0]) {
                 if (name) plist_mem_free(name);
@@ -798,25 +804,26 @@ raop_handler_setup(raop_conn_t *conn,
         if (admit_client == false) {
             /* client is not authorized to connect */
             plist_mem_free(name);
-            name = NULL;
-            plist_free(res_root_node);
-            plist_free(req_root_node);
+            http_response_init(response, "RTSP/1.0", 403, "Forbidden");
             return;
         }
 
-        plist_get_data_val(req_eiv_node, &eiv, &eiv_len);
-        memcpy(aesiv, eiv, 16);
-        free(eiv);	
-        logger_log(raop->logger, LOGGER_DEBUG, "eiv_len = %llu", eiv_len);
-        if (logger_debug) {
-            char* str = utils_data_to_string(aesiv, 16, 16);
-            logger_log(raop->logger, LOGGER_DEBUG, "16 byte aesiv (needed for AES-CBC audio decryption iv):\n%s", str);
-            free(str);
-        }
-
-        char* ekey = NULL;
+        unsigned char* ekey = NULL;
         uint64_t ekey_len = 0;
-        plist_get_data_val(req_ekey_node, &ekey, &ekey_len);
+        char* eiv = NULL;
+        uint64_t eiv_len = 0;
+        plist_get_data_val(req_ekey_node, (char**)&ekey, &ekey_len);
+        plist_get_data_val(req_eiv_node, (char**)&eiv, &eiv_len);
+        if (ekey_len != 72 || eiv_len != 16) {
+            logger_log(raop->logger, LOGGER_ERR, "invalid ekey or eiv lengths in SETUP 1: %llu %llu", ekey_len, eiv_len);
+            http_response_init(response, "RTSP/1.0", 500, "Internal Server Error");
+            free(ekey);
+            free(eiv);
+            if (name) plist_mem_free(name);
+            return;
+        }
+        memcpy(aesiv, eiv, 16);
+        free(eiv);
         memcpy(eaeskey,ekey,72);
         free(ekey);
         logger_log(raop->logger, LOGGER_DEBUG, "ekey_len = %llu", ekey_len);
@@ -857,10 +864,7 @@ raop_handler_setup(raop_conn_t *conn,
                  * UxPlay may be able to function with byte 27 turned off because it currently does not support connections 
                  * with more than one client at a time. AppleTV supports up to 12 clients, uses pairing to give each a distinct
                  * SessionID and ecdh_secret.
-            
-                 * The "old protocol" Windows AirPlay client AirMyPC seems not to respect the byte 27 setting, and always sets
-                 * up the  ecdh_secret, but decryption fails if aeskey is hashed.*/
-
+                 */
                 if (logger_debug) {
                     char *str = utils_data_to_string(ecdh_secret, X25519_KEY_SIZE, 16);
                     logger_log(raop->logger, LOGGER_DEBUG, "32 byte shared ecdh_secret:\n%s", str);
@@ -958,6 +962,9 @@ raop_handler_setup(raop_conn_t *conn,
         const char *effective_name = (name && name[0]) ? name : (conn->device_name && conn->device_name[0] ? conn->device_name : (model && model[0] ? model : "AirPlay Device"));
         if (raop->callbacks.multi_client_set_name) {
             raop->callbacks.multi_client_set_name(raop->callbacks.cls, conn->raop_ntp, effective_name);
+        }
+        if (raop->callbacks.multi_client_set_ip && remote[0]) {
+            raop->callbacks.multi_client_set_ip(raop->callbacks.cls, conn->raop_ntp, remote);
         }
         if (name) {
             free(name);

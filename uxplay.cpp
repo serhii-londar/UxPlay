@@ -2166,6 +2166,7 @@ static bool check_blocked_client(char *deviceid) {
 static std::mutex multi_client_slot_mutex;
 static std::map<raop_ntp_t*, int> multi_client_slot_by_ntp;
 static std::map<raop_ntp_t*, std::string> multi_client_name_by_ntp;
+static std::map<raop_ntp_t*, std::string> multi_client_ip_by_ntp;
 struct multi_client_dacp_info_t { std::string dacp_id; std::string active_remote; };
 static std::map<raop_ntp_t*, multi_client_dacp_info_t> multi_client_dacp_by_ntp;
 static bool multi_client_slot_busy[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = { false };
@@ -2252,6 +2253,7 @@ static void multi_client_release_slot(raop_ntp_t *ntp) {
         /* unconditional: a client that never reached video_set_codec (e.g. rejected for
          * sending H265) still got a name recorded and would otherwise leak this entry */
         multi_client_name_by_ntp.erase(ntp);
+        multi_client_ip_by_ntp.erase(ntp);
         multi_client_dacp_by_ntp.erase(ntp);
         auto it = multi_client_slot_by_ntp.find(ntp);
         if (it == multi_client_slot_by_ntp.end()) {
@@ -2280,6 +2282,14 @@ extern "C" void multi_client_set_name(void *cls, raop_ntp_t *ntp, const char *na
     }
 }
 
+// Stashes the client's IP address keyed by ntp for mDNS reverse lookup on the receiver.
+extern "C" void multi_client_set_ip(void *cls, raop_ntp_t *ntp, const char *ip) {
+    if (multi_client_max > 0 && ntp && ip && ip[0]) {
+        std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
+        multi_client_ip_by_ntp[ntp] = ip;
+    }
+}
+
 // Same wiring as multi_client_set_name above, for the DACP remote-control identity.
 extern "C" void multi_client_set_dacp(void *cls, raop_ntp_t *ntp, const char *dacp_id, const char *active_remote) {
     if (multi_client_max > 0 && ntp && dacp_id && dacp_id[0] && active_remote && active_remote[0]) {
@@ -2301,6 +2311,7 @@ extern "C" void video_reset(void *cls, raop_ntp_t *ntp, reset_type_t type) {
 	    url.erase();
             raop_destroy_airplay_video(raop, -1);
         }
+        break;
     case RESET_TYPE_HLS_EOS:
         LOGD("video_reset: type= HLS_eos");
         if (use_video) {
@@ -2378,6 +2389,7 @@ extern "C" int video_set_codec(void *cls, raop_ntp_t *ntp, video_codec_t codec) 
             return -1;
         }
         std::string device_name_copy = "AirPlay Device";
+        std::string client_ip_copy = "";
         std::string dacp_id_copy, active_remote_copy;
         {
             std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
@@ -2385,17 +2397,21 @@ extern "C" int video_set_codec(void *cls, raop_ntp_t *ntp, video_codec_t codec) 
             if (name_it != multi_client_name_by_ntp.end()) {
                 device_name_copy = name_it->second;
             }
+            auto ip_it = multi_client_ip_by_ntp.find(ntp);
+            if (ip_it != multi_client_ip_by_ntp.end()) {
+                client_ip_copy = ip_it->second;
+            }
             auto dacp_it = multi_client_dacp_by_ntp.find(ntp);
             if (dacp_it != multi_client_dacp_by_ntp.end()) {
                 dacp_id_copy = dacp_it->second.dacp_id;
                 active_remote_copy = dacp_it->second.active_remote;
             }
         }
-        /* dacp_id/active_remote are plain tokens (no spaces) so they're safe as fixed-width
+        /* dacp_id/active_remote/client_ip are plain tokens (no spaces) so they're safe as fixed-width
          * space-delimited fields; device_name must stay last since it can contain spaces and
          * the Swift-side parser reads it as "rest of line" (see processStdoutChunk). */
-        printf("CLIENT_CONNECTED slot=%d video_port=%u dacp_id=%s active_remote=%s device_name=%s\n",
-               slot, port, dacp_id_copy.c_str(), active_remote_copy.c_str(), device_name_copy.c_str());
+        printf("CLIENT_CONNECTED slot=%d video_port=%u client_ip=%s dacp_id=%s active_remote=%s device_name=%s\n",
+               slot, port, client_ip_copy.c_str(), dacp_id_copy.c_str(), active_remote_copy.c_str(), device_name_copy.c_str());
         fflush(stdout);
         return 0;
     }
@@ -3022,6 +3038,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.audio_set_progress = audio_set_progress;
     raop_cbs.report_client_request = report_client_request;
     raop_cbs.multi_client_set_name = multi_client_set_name;
+    raop_cbs.multi_client_set_ip = multi_client_set_ip;
     raop_cbs.multi_client_set_dacp = multi_client_set_dacp;
     raop_cbs.display_pin = display_pin;
     raop_cbs.register_client = register_client;

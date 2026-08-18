@@ -384,16 +384,47 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         if (!dev_name) {
             dev_name = http_request_get_header(request, "X-Apple-Client-Name");
         }
+        if (!dev_name) {
+            dev_name = http_request_get_header(request, "X-Apple-Device-Model");
+        }
+        if (!dev_name) {
+            dev_name = http_request_get_header(request, "X-Apple-Model");
+        }
         if (dev_name && dev_name[0]) {
             conn->device_name = strdup(dev_name);
         } else {
+            const char *ua = http_request_get_header(request, "User-Agent");
+            if (ua) {
+                const char *open_paren = strchr(ua, '(');
+                if (open_paren) {
+                    open_paren++;
+                    const char *semi = strpbrk(open_paren, ";)");
+                    if (semi && semi > open_paren) {
+                        size_t mlen = (size_t)(semi - open_paren);
+                        char model_buf[64] = { 0 };
+                        if (mlen < sizeof(model_buf)) {
+                            memcpy(model_buf, open_paren, mlen);
+                            char *start = model_buf;
+                            while (*start == ' ') start++;
+                            char *end = start + strlen(start) - 1;
+                            while (end > start && *end == ' ') { *end = '\0'; end--; }
+                            if (*start) {
+                                conn->device_name = strdup(start);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (!conn->device_name) {
             char host[NI_MAXHOST] = { 0 };
-            if (getnameinfo((struct sockaddr *)&conn->remote, (socklen_t)conn->remotelen, host, sizeof(host), NULL, 0, NI_NAMEREQD) == 0 && host[0]) {
+            if (getnameinfo((struct sockaddr *)&conn->remote, (socklen_t)conn->remotelen, host, sizeof(host), NULL, 0, 0) == 0 && host[0]) {
                 char *dot = strstr(host, ".local");
                 if (dot) *dot = '\0';
                 dot = strstr(host, ".lan");
                 if (dot) *dot = '\0';
-                if (host[0]) {
+                // Check that host is not just numeric IP repeated
+                if (host[0] && strcmp(host, "localhost") != 0 && strpbrk(host, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ")) {
                     conn->device_name = strdup(host);
                 }
             }

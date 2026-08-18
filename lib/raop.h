@@ -106,6 +106,8 @@ struct raop_callbacks_s {
      * report_client_request -- which has no ntp yet at the point it fires -- against the
      * per-connection thread that later resolves the slot from ntp. */
     void  (*multi_client_set_name) (void *cls, raop_ntp_t *ntp, const char *name);
+    /* associates the client's IP address with this connection's ntp for mDNS reverse resolution */
+    void  (*multi_client_set_ip) (void *cls, raop_ntp_t *ntp, const char *ip);
     /* same rationale as multi_client_set_name above, for the DACP remote-control identity
      * (Active-Remote token + DACP-ID) each connection's requests carry -- lets multi-client
      * mode target a specific connected device's Now Playing session instead of only ever
