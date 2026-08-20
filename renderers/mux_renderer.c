@@ -132,7 +132,7 @@ void mux_renderer_start(void) {
         }
         g_string_append(launch, "mux. ");
     }
-    g_string_append(launch, "mp4mux name=mux ! filesink name=filesink location=");
+    g_string_append(launch, "mp4mux name=mux fragment-duration=2000 fragment-mode=first-moov-then-finalise ! filesink name=filesink location=");
     g_string_append(launch, filename->str);
 
     logger_log(logger, LOGGER_DEBUG, "created Mux pipeline: %s", launch->str);

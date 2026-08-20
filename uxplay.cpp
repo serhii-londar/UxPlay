@@ -2754,6 +2754,7 @@ extern "C" void audio_get_format (void *cls, raop_ntp_t *ntp, unsigned char *ct,
         audio_dumpfile = NULL;
     }
     audio_type = type;
+    remote_clock_offset = 0;
 
     if (multi_client_max > 0 && ntp) {
         int slot = multi_client_alloc_slot(ntp);

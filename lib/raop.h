@@ -86,6 +86,7 @@ struct raop_callbacks_s {
 
     /* Optional but recommended callback functions (probably not optional, check this)*/
     void  (*conn_init)(void *cls);
+    void  (*conn_teardown)(void *cls);
     void  (*conn_destroy)(void *cls, raop_ntp_t *ntp);
     void  (*audio_flush)(void *cls, raop_ntp_t *ntp);
     void  (*video_flush)(void *cls, raop_ntp_t *ntp);
