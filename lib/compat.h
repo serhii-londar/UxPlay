@@ -15,7 +15,7 @@
 #ifndef COMPAT_H
 #define COMPAT_H
 
-#if defined(WIN32)
+#if defined(WIN32) || defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
  #define WIN32_LEAN_AND_MEAN
 #endif
@@ -24,9 +24,33 @@
 #include <mstcpip.h>
 #include <mswsock.h>
 #include <windows.h>
+#include <time.h>
+#include <BaseTsd.h>
+
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED
+typedef SSIZE_T ssize_t;
+#endif
+
+#if defined(_MSC_VER) && _MSC_VER < 1900
 #ifndef snprintf
 #define snprintf _snprintf
 #endif
+#endif
+
+#ifndef SOL_TCP
+#define SOL_TCP IPPROTO_TCP
+#endif
+
+#ifndef CLOCK_REALTIME
+#define CLOCK_REALTIME 0
+#endif
+
+static inline int clock_gettime(int clk_id, struct timespec *tp) {
+    (void)clk_id;
+    timespec_get(tp, TIME_UTC);
+    return 0;
+}
 #else
 #include <sys/types.h>
 #include <sys/socket.h>

@@ -21,15 +21,25 @@
 /* Always use pthread library */
 
 #include <pthread.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#define sleepms(x) Sleep(x)
+#define usleep(x) Sleep(((x) + 999) / 1000)
+#else
 #include <unistd.h>
-
 #define sleepms(x) usleep((x)*1000)
+#endif
+
+#include <string.h>
 
 typedef pthread_t thread_handle_t;
 
 #define THREAD_RETVAL void *
 #define THREAD_CREATE(handle, func, arg) \
-	if (pthread_create(&(handle), NULL, func, arg)) handle = 0
+	do { if (pthread_create(&(handle), NULL, func, arg) != 0) memset(&(handle), 0, sizeof(handle)); } while (0)
 #define THREAD_JOIN(handle) pthread_join(handle, NULL)
 
 typedef pthread_mutex_t mutex_handle_t;

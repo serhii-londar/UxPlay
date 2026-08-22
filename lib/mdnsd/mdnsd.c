@@ -1010,8 +1010,7 @@ int mdnsd_start(mdnsd_t *mdnsd)
     }
 
     mdnsd->running = 1;
-    THREAD_CREATE(mdnsd->thread, mdns_thread, mdnsd);
-    if (!mdnsd->thread) {
+    if (pthread_create(&mdnsd->thread, NULL, mdns_thread, mdnsd) != 0) {
         if (mdnsd->sock_fd4 != -1) {
             CLOSESOCKET(mdnsd->sock_fd4);
             mdnsd->sock_fd4 = -1;
@@ -1033,7 +1032,9 @@ void mdnsd_stop(mdnsd_t *mdnsd)
 {
     int fd4 = -1;
     int fd6 = -1;
-    thread_handle_t thread = 0;
+    int has_thread = 0;
+    thread_handle_t thread;
+    memset(&thread, 0, sizeof(thread));
 
     if (!mdnsd) {
         return;
@@ -1045,9 +1046,10 @@ void mdnsd_stop(mdnsd_t *mdnsd)
         fd4 = mdnsd->sock_fd4;
         fd6 = mdnsd->sock_fd6;
         thread = mdnsd->thread;
+        has_thread = 1;
         mdnsd->sock_fd4 = -1;
         mdnsd->sock_fd6 = -1;
-        mdnsd->thread = 0;
+        memset(&mdnsd->thread, 0, sizeof(mdnsd->thread));
     }
     MUTEX_UNLOCK(mdnsd->mutex);
 
@@ -1057,7 +1059,7 @@ void mdnsd_stop(mdnsd_t *mdnsd)
     if (fd6 != -1) {
         CLOSESOCKET(fd6);
     }
-    if (thread) {
+    if (has_thread) {
         THREAD_JOIN(thread);
     }
 }

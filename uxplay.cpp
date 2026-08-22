@@ -22,7 +22,9 @@
 
 #include <stddef.h>
 #include <cstring>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <ctype.h>
 #include <string>
 #include <algorithm>
@@ -41,6 +43,7 @@
 #include <inttypes.h>
 
 #ifdef _WIN32  /*modifications for Windows compilation */
+#include <io.h>
 #include <glib.h>
 #include <unordered_map>
 #include <winsock2.h>

@@ -68,7 +68,7 @@ if ( APPLE )
                          llhttp )
 elseif( WIN32 )
   target_link_libraries( airplay 
-                         pthread
+                         pthreadVC3
                          playfair
                          dnssd
                          llhttp

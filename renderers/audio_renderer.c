@@ -233,8 +233,13 @@ int audio_renderer_multi_client_start(int slot, unsigned char ct, const char *rt
 
     GString *launch = g_string_new("appsrc name=audio_source ! queue ! ");
     g_string_append(launch, decoder);
-    g_string_append(launch, "audioconvert ! audioresample ! audio/x-raw,format=S16BE,rate=44100,channels=2 ! rtpL16pay ");
-    g_string_append(launch, pipeline_str->str);
+    if (g_strstr_len(rtp_pipeline_template, -1, "%PORT%") != NULL) {
+        g_string_append(launch, "audioconvert ! audioresample ! audio/x-raw,format=S16BE,rate=44100,channels=2 ! rtpL16pay ");
+        g_string_append(launch, pipeline_str->str);
+    } else {
+        g_string_append(launch, "audioconvert ! audioresample ! ");
+        g_string_append(launch, pipeline_str->str);
+    }
     g_string_free(pipeline_str, TRUE);
 
     logger_log(logger, LOGGER_DEBUG, "GStreamer multi-client audio pipeline (slot %d):\n\"%s\"", slot, launch->str);

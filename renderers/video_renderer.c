@@ -24,6 +24,12 @@
 #include <gst/app/gstappsrc.h>
 #include "video_renderer.h"
 
+#ifdef _WIN32
+#ifndef strtok_r
+#define strtok_r strtok_s
+#endif
+#endif
+
 #define SECOND_IN_NSECS 1000000000UL
 #define SECOND_IN_MICROSECS 1000000
 #ifdef X_DISPLAY_FIX
