@@ -3,14 +3,16 @@ include_directories( playfair llhttp )
 message( STATUS "*** CFLAGS \"" ${CMAKE_C_FLAGS} "\" from build environment will be postpended to CMAKE_CFLAGS" )
 
 # Common x86/x86_64 cflags
-if( NOT NO_MARCH_NATIVE AND CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)" )
-  set( CMAKE_C_FLAGS "-O3 -march=native ${CMAKE_C_FLAGS}" )
-  message( STATUS "Using CFLAGS with  -march=native" )
-  message( STATUS "*** ONLY USE THIS WHEN COMPILING ON THE MACHINE THAT WILL RUN UXPLAY" )
-  message( STATUS "  run \"cmake -DNO_MARCH_NATIVE=ON\" to switch off this compiler option" )
-else()
-  message( STATUS "Not using -march=native" )
-  set( CMAKE_C_FLAGS "-O2 ${CMAKE_C_FLAGS}" )
+if( NOT MSVC )
+  if( NOT NO_MARCH_NATIVE AND CMAKE_SYSTEM_PROCESSOR MATCHES "(x86)|(X86)|(amd64)|(AMD64)" )
+    set( CMAKE_C_FLAGS "-O3 -march=native ${CMAKE_C_FLAGS}" )
+    message( STATUS "Using CFLAGS with  -march=native" )
+    message( STATUS "*** ONLY USE THIS WHEN COMPILING ON THE MACHINE THAT WILL RUN UXPLAY" )
+    message( STATUS "  run \"cmake -DNO_MARCH_NATIVE=ON\" to switch off this compiler option" )
+  else()
+    message( STATUS "Not using -march=native" )
+    set( CMAKE_C_FLAGS "-O2 ${CMAKE_C_FLAGS}" )
+  endif()
 endif()
 
 # Common Linux cflags
@@ -20,7 +22,11 @@ endif()
 
 if ( WIN32 )
   message( STATUS "Building for Windows " )
-  set( CMAKE_C_FLAGS "-DSTANDALONE -D__STDC_CONSTANT_MACROS -D__STDC_LIMIT_MACROS -DTARGET_POSIX -D_WIN32 -fPIC -DPIC -D_REENTRANT -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 -Wall ${CMAKE_C_FLAGS}" )
+  if ( MSVC )
+    add_compile_definitions( STANDALONE __STDC_CONSTANT_MACROS __STDC_LIMIT_MACROS TARGET_POSIX _WIN32 _CRT_SECURE_NO_WARNINGS _CRT_NONSTDC_NO_WARNINGS )
+  else()
+    set( CMAKE_C_FLAGS "-DSTANDALONE -D__STDC_CONSTANT_MACROS -D__STDC_LIMIT_MACROS -DTARGET_POSIX -D_WIN32 -fPIC -DPIC -D_REENTRANT -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64 -Wall ${CMAKE_C_FLAGS}" )
+  endif()
 endif()
 
 message( STATUS "using CMAKE_CFLAGS: " ${CMAKE_C_FLAGS} )
@@ -67,8 +73,17 @@ if ( APPLE )
                          dnssd
                          llhttp )
 elseif( WIN32 )
+  if( MSVC )
+    find_library( PTHREAD_LIB NAMES pthreadVC3 pthreadVC2 pthread pthreads PThreads4W )
+    if( NOT PTHREAD_LIB )
+      set( PTHREAD_LIB pthreadVC3 )
+    endif()
+    set( AIRPLAY_PTHREAD ${PTHREAD_LIB} )
+  else()
+    set( AIRPLAY_PTHREAD pthread )
+  endif()
   target_link_libraries( airplay 
-                         pthreadVC3
+                         ${AIRPLAY_PTHREAD}
                          playfair
                          dnssd
                          llhttp

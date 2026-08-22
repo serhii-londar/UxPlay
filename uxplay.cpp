@@ -785,7 +785,11 @@ static const char *get_homedir() {
     if (homedir == NULL) {
         homedir = getenv("HOME");
     }
-#ifndef _WIN32
+#ifdef _WIN32
+    if (homedir == NULL) {
+        homedir = getenv("USERPROFILE");
+    }
+#else
     if (homedir == NULL){
         homedir = getpwuid(getuid())->pw_dir;
     }
@@ -1710,8 +1714,13 @@ static void parse_arguments (int argc, char *argv[]) {
                     exit(1);
                 }   
             } else {
-                dacpfile.append(get_homedir());
-                dacpfile.append("/.uxplay.dacp");
+                const char *homedir = get_homedir();
+                if (homedir) {
+                    dacpfile.append(homedir);
+                    dacpfile.append("/.uxplay.dacp");
+                } else {
+                    dacpfile.append(".uxplay.dacp");
+                }
             }
         } else if (arg == "-taper") {
             taper_volume = true;

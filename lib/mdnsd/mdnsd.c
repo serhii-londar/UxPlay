@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#ifndef WIN32
+#if !defined(WIN32) && !defined(_WIN32)
 #include <ifaddrs.h>
 #include <net/if.h>
 #endif
@@ -374,7 +374,7 @@ static uint32_t mdns_get_default_ipv4(void)
 
 static int mdns_get_default_ipv6(unsigned char addr[16], unsigned int *scope_id)
 {
-#ifdef WIN32
+#if defined(WIN32) || defined(_WIN32)
     (void) addr;
     (void) scope_id;
     return 0;

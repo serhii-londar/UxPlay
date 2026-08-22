@@ -30,7 +30,7 @@
  * modified (2023) by fduncanh for use with Apple's pair-setup-pin protocol
  */
 #define APPLE_VARIANT
-#ifdef WIN32
+#if defined(WIN32) || defined(_WIN32)
 # include <Windows.h>
 # include <Wincrypt.h>
 #else
@@ -584,14 +584,14 @@ static void init_random()
     if (g_initialized)
         return;
 
-#ifdef WIN32
+#if defined(WIN32) || defined(_WIN32)
     HCRYPTPROV wctx;
 #else
     FILE   *fp   = 0;
 #endif
     unsigned char buff[64];
 
-#ifdef WIN32
+#if defined(WIN32) || defined(_WIN32)
         CryptAcquireContext(&wctx, NULL, NULL, PROV_RSA_FULL, CRYPT_VERIFYCONTEXT);
         CryptGenRandom(wctx, sizeof(buff), (BYTE*) buff);
         CryptReleaseContext(wctx, 0);

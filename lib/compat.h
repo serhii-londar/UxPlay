@@ -27,23 +27,28 @@
 #include <time.h>
 #include <BaseTsd.h>
 
+#if defined(_MSC_VER)
 #ifndef _SSIZE_T_DEFINED
 #define _SSIZE_T_DEFINED
 typedef SSIZE_T ssize_t;
 #endif
 
-#if defined(_MSC_VER) && _MSC_VER < 1900
+#if _MSC_VER < 1900
 #ifndef snprintf
 #define snprintf _snprintf
 #endif
 #endif
 
-#ifndef SOL_TCP
-#define SOL_TCP IPPROTO_TCP
+#ifndef strtok_r
+#define strtok_r strtok_s
 #endif
 
 #ifndef CLOCK_REALTIME
 #define CLOCK_REALTIME 0
+#endif
+
+#ifndef CLOCK_MONOTONIC
+#define CLOCK_MONOTONIC 1
 #endif
 
 static inline int clock_gettime(int clk_id, struct timespec *tp) {
@@ -51,6 +56,11 @@ static inline int clock_gettime(int clk_id, struct timespec *tp) {
     timespec_get(tp, TIME_UTC);
     return 0;
 }
+#endif
+
+#ifndef SOL_TCP
+#define SOL_TCP IPPROTO_TCP
+#endif
 #else
 #include <sys/types.h>
 #include <sys/socket.h>
