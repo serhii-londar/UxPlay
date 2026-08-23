@@ -2183,21 +2183,21 @@ static std::map<raop_ntp_t*, std::string> multi_client_ip_by_ntp;
 struct multi_client_dacp_info_t { std::string dacp_id; std::string active_remote; };
 static std::map<raop_ntp_t*, multi_client_dacp_info_t> multi_client_dacp_by_ntp;
 static bool multi_client_slot_busy[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = { false };
+static std::atomic<bool> multi_client_clock_offset_init[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = {};
 static std::atomic<uint64_t> multi_client_clock_offset[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = {};
 
 static inline uint64_t get_or_init_client_clock_offset(int slot, uint64_t ntp_time_local, uint64_t ntp_time_remote) {
-    uint64_t offset = multi_client_clock_offset[slot].load(std::memory_order_acquire);
-    if (!offset) {
+    if (multi_client_clock_offset_init[slot].load(std::memory_order_acquire)) {
+        return multi_client_clock_offset[slot].load(std::memory_order_relaxed);
+    }
+    std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
+    if (!multi_client_clock_offset_init[slot].load(std::memory_order_relaxed)) {
         uint64_t local_time = (ntp_time_local ? ntp_time_local : get_local_time());
         uint64_t new_offset = local_time - ntp_time_remote;
-        uint64_t expected = 0;
-        if (multi_client_clock_offset[slot].compare_exchange_strong(expected, new_offset, std::memory_order_acq_rel)) {
-            offset = new_offset;
-        } else {
-            offset = expected;
-        }
+        multi_client_clock_offset[slot].store(new_offset, std::memory_order_relaxed);
+        multi_client_clock_offset_init[slot].store(true, std::memory_order_release);
     }
-    return offset;
+    return multi_client_clock_offset[slot].load(std::memory_order_relaxed);
 }
 
 static int multi_client_alloc_slot(raop_ntp_t *ntp) {
@@ -2300,7 +2300,8 @@ static void multi_client_release_slot(raop_ntp_t *ntp) {
 
     {
         std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
-        multi_client_clock_offset[slot].store(0, std::memory_order_release);
+        multi_client_clock_offset_init[slot].store(false, std::memory_order_release);
+        multi_client_clock_offset[slot].store(0, std::memory_order_relaxed);
         multi_client_slot_busy[slot] = false;
     }
 
