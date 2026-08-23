@@ -132,6 +132,9 @@ void audio_renderer_multi_client_init(logger_t *render_logger) {
      * mode -- detect here instead, so per-slot pipelines know which decoders they can use. */
     aac = check_plugin_feature(avdec_aac);
     alac = check_plugin_feature(avdec_alac);
+    for (int i = 0; i < VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS; i++) {
+        g_mutex_init(&multi_client_audio_slots[i].lock);
+    }
 }
 
 /* ===== Multi-client mirroring audio =====
@@ -145,6 +148,7 @@ typedef struct {
     bool active;
     unsigned char ct;
     guint bus_watch_id;
+    GMutex lock;
 } multi_client_audio_slot_t;
 
 static multi_client_audio_slot_t multi_client_audio_slots[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS];
@@ -186,12 +190,14 @@ int audio_renderer_multi_client_start(int slot, unsigned char ct, const char *rt
         return -1;
     }
     multi_client_audio_slot_t *s = &multi_client_audio_slots[slot];
-    if (s->active) {
-        if (s->ct == ct) {
-            return 0; /* already running the right codec for this slot */
-        }
-        audio_renderer_multi_client_stop(slot);
+    g_mutex_lock(&s->lock);
+    if (s->active && s->ct == ct) {
+        g_mutex_unlock(&s->lock);
+        return 0; /* already running the right codec for this slot */
     }
+    g_mutex_unlock(&s->lock);
+
+    audio_renderer_multi_client_stop(slot);
 
     const char *decoder;
     const char *caps_str;
@@ -245,9 +251,9 @@ int audio_renderer_multi_client_start(int slot, unsigned char ct, const char *rt
     logger_log(logger, LOGGER_DEBUG, "GStreamer multi-client audio pipeline (slot %d):\n\"%s\"", slot, launch->str);
 
     GError *error = NULL;
-    s->pipeline = gst_parse_launch(launch->str, &error);
+    GstElement *pipeline = gst_parse_launch(launch->str, &error);
     g_string_free(launch, TRUE);
-    if (!s->pipeline) {
+    if (!pipeline) {
         logger_log(logger, LOGGER_ERR, "multi-client audio slot %d: gst_parse_launch failed: %s",
                    slot, error ? error->message : "(unknown error)");
         if (error) g_clear_error(&error);
@@ -256,27 +262,33 @@ int audio_renderer_multi_client_start(int slot, unsigned char ct, const char *rt
 
     GstClock *clock = gst_system_clock_obtain();
     g_object_set(clock, "clock-type", GST_CLOCK_TYPE_REALTIME, NULL);
-    gst_pipeline_use_clock(GST_PIPELINE_CAST(s->pipeline), clock);
+    gst_pipeline_use_clock(GST_PIPELINE_CAST(pipeline), clock);
     gst_object_unref(clock);
 
-    s->appsrc = gst_bin_get_by_name(GST_BIN(s->pipeline), "audio_source");
-    if (!s->appsrc) {
+    GstElement *appsrc = gst_bin_get_by_name(GST_BIN(pipeline), "audio_source");
+    if (!appsrc) {
         logger_log(logger, LOGGER_ERR, "multi-client audio slot %d: pipeline has no \"audio_source\" appsrc", slot);
-        gst_object_unref(s->pipeline);
-        s->pipeline = NULL;
+        gst_object_unref(pipeline);
         return -1;
     }
     GstCaps *caps = gst_caps_from_string(caps_str);
-    g_object_set(s->appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
+    g_object_set(appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
     gst_caps_unref(caps);
 
-    GstBus *bus = gst_element_get_bus(s->pipeline);
-    s->bus_watch_id = gst_bus_add_watch(bus, multi_client_audio_bus_callback, GINT_TO_POINTER(slot));
+    GstBus *bus = gst_element_get_bus(pipeline);
+    guint bus_watch_id = gst_bus_add_watch(bus, multi_client_audio_bus_callback, GINT_TO_POINTER(slot));
     gst_object_unref(bus);
 
-    gst_element_set_state(s->pipeline, GST_STATE_PLAYING);
-    s->active = true;
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+
+    g_mutex_lock(&s->lock);
+    s->pipeline = pipeline;
+    s->appsrc = appsrc;
+    s->bus_watch_id = bus_watch_id;
     s->ct = ct;
+    s->active = true;
+    g_mutex_unlock(&s->lock);
+
     return 0;
 }
 
@@ -285,7 +297,9 @@ void audio_renderer_multi_client_push(int slot, unsigned char *data, int data_le
         return;
     }
     multi_client_audio_slot_t *s = &multi_client_audio_slots[slot];
+    g_mutex_lock(&s->lock);
     if (!s->active || !s->appsrc || data_len <= 0) {
+        g_mutex_unlock(&s->lock);
         return;
     }
 
@@ -316,8 +330,11 @@ void audio_renderer_multi_client_push(int slot, unsigned char *data, int data_le
         break;
     }
     if (!valid) {
+        unsigned char byte0 = data[0];
+        unsigned char ct = s->ct;
+        g_mutex_unlock(&s->lock);
         logger_log(logger, LOGGER_ERR, "multi-client audio slot %d: invalid audio frame (ct %d) skipped, first byte 0x%2.2x",
-                   slot, s->ct, (unsigned int) data[0]);
+                   slot, ct, (unsigned int) byte0);
         return;
     }
 
@@ -347,6 +364,7 @@ void audio_renderer_multi_client_push(int slot, unsigned char *data, int data_le
 
     gst_buffer_fill(buffer, 0, data, data_len);
     gst_app_src_push_buffer(GST_APP_SRC(s->appsrc), buffer);
+    g_mutex_unlock(&s->lock);
 }
 
 void audio_renderer_multi_client_stop(int slot) {
@@ -354,23 +372,35 @@ void audio_renderer_multi_client_stop(int slot) {
         return;
     }
     multi_client_audio_slot_t *s = &multi_client_audio_slots[slot];
+    GstElement *pipeline = NULL;
+    GstElement *appsrc = NULL;
+    guint bus_watch_id = 0;
+
+    g_mutex_lock(&s->lock);
     if (!s->active) {
+        g_mutex_unlock(&s->lock);
         return;
     }
-    if (s->appsrc) {
-        gst_app_src_end_of_stream(GST_APP_SRC(s->appsrc));
-    }
-    if (s->pipeline) {
-        gst_element_set_state(s->pipeline, GST_STATE_NULL);
-        gst_object_unref(s->pipeline);
-    }
-    if (s->bus_watch_id) {
-        g_source_remove(s->bus_watch_id);
-        s->bus_watch_id = 0;
-    }
-    s->pipeline = NULL;
-    s->appsrc = NULL;
     s->active = false;
+    appsrc = s->appsrc;
+    pipeline = s->pipeline;
+    bus_watch_id = s->bus_watch_id;
+    s->appsrc = NULL;
+    s->pipeline = NULL;
+    s->bus_watch_id = 0;
+    g_mutex_unlock(&s->lock);
+
+    if (appsrc) {
+        gst_app_src_end_of_stream(GST_APP_SRC(appsrc));
+        gst_object_unref(appsrc);
+    }
+    if (pipeline) {
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+    }
+    if (bus_watch_id) {
+        g_source_remove(bus_watch_id);
+    }
 }
 
 void audio_renderer_init(logger_t *render_logger, const char* audiosink, const bool* audio_sync, const bool* video_sync, const char *artp_pipeline) {

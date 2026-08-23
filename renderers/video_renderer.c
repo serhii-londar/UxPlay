@@ -669,6 +669,7 @@ typedef struct {
     GstElement *pipeline;
     bool active;
     guint bus_watch_id;
+    GMutex lock;
 } multi_client_video_slot_t;
 
 static multi_client_video_slot_t multi_client_video_slots[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS];
@@ -714,6 +715,9 @@ static gboolean multi_client_video_bus_callback(GstBus *bus, GstMessage *message
  * crash on first use -- set just that, without touching any singleton pipeline state. */
 void video_renderer_multi_client_init(logger_t *render_logger) {
     logger = render_logger;
+    for (int i = 0; i < VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS; i++) {
+        g_mutex_init(&multi_client_video_slots[i].lock);
+    }
 }
 
 int video_renderer_multi_client_start(int slot, const char *parser, const char *rtp_pipeline_template,
@@ -721,10 +725,7 @@ int video_renderer_multi_client_start(int slot, const char *parser, const char *
     if (slot < 0 || slot >= VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS) {
         return -1;
     }
-    multi_client_video_slot_t *s = &multi_client_video_slots[slot];
-    if (s->active) {
-        video_renderer_multi_client_stop(slot);
-    }
+    video_renderer_multi_client_stop(slot);
 
     /* the -vrtp template carries a %PORT% placeholder each slot substitutes with its own loopback port */
     gchar *port_str = g_strdup_printf("%u", port);
@@ -745,9 +746,9 @@ int video_renderer_multi_client_start(int slot, const char *parser, const char *
     logger_log(logger, LOGGER_DEBUG, "GStreamer multi-client video pipeline (slot %d):\n\"%s\"", slot, launch->str);
 
     GError *error = NULL;
-    s->pipeline = gst_parse_launch(launch->str, &error);
+    GstElement *pipeline = gst_parse_launch(launch->str, &error);
     g_string_free(launch, TRUE);
-    if (!s->pipeline) {
+    if (!pipeline) {
         logger_log(logger, LOGGER_ERR, "multi-client video slot %d: gst_parse_launch failed: %s",
                    slot, error ? error->message : "(unknown error)");
         if (error) g_clear_error(&error);
@@ -756,26 +757,33 @@ int video_renderer_multi_client_start(int slot, const char *parser, const char *
 
     GstClock *clock = gst_system_clock_obtain();
     g_object_set(clock, "clock-type", GST_CLOCK_TYPE_REALTIME, NULL);
-    gst_pipeline_use_clock(GST_PIPELINE_CAST(s->pipeline), clock);
+    gst_pipeline_use_clock(GST_PIPELINE_CAST(pipeline), clock);
     gst_object_unref(clock);
 
-    s->appsrc = gst_bin_get_by_name(GST_BIN(s->pipeline), "video_source");
-    if (!s->appsrc) {
+    GstElement *appsrc = gst_bin_get_by_name(GST_BIN(pipeline), "video_source");
+    if (!appsrc) {
         logger_log(logger, LOGGER_ERR, "multi-client video slot %d: pipeline has no \"video_source\" appsrc", slot);
-        gst_object_unref(s->pipeline);
-        s->pipeline = NULL;
+        gst_object_unref(pipeline);
         return -1;
     }
     GstCaps *caps = gst_caps_from_string(video_is_h265 ? h265_caps : h264_caps);
-    g_object_set(s->appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
+    g_object_set(appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
     gst_caps_unref(caps);
 
-    GstBus *bus = gst_element_get_bus(s->pipeline);
-    s->bus_watch_id = gst_bus_add_watch(bus, multi_client_video_bus_callback, GINT_TO_POINTER(slot));
+    GstBus *bus = gst_element_get_bus(pipeline);
+    guint bus_watch_id = gst_bus_add_watch(bus, multi_client_video_bus_callback, GINT_TO_POINTER(slot));
     gst_object_unref(bus);
 
-    gst_element_set_state(s->pipeline, GST_STATE_PLAYING);
+    gst_element_set_state(pipeline, GST_STATE_PLAYING);
+
+    multi_client_video_slot_t *s = &multi_client_video_slots[slot];
+    g_mutex_lock(&s->lock);
+    s->pipeline = pipeline;
+    s->appsrc = appsrc;
+    s->bus_watch_id = bus_watch_id;
     s->active = true;
+    g_mutex_unlock(&s->lock);
+
     return 0;
 }
 
@@ -784,11 +792,14 @@ void video_renderer_multi_client_push(int slot, unsigned char *data, int data_le
         return;
     }
     multi_client_video_slot_t *s = &multi_client_video_slots[slot];
+    g_mutex_lock(&s->lock);
     if (!s->active || !s->appsrc) {
+        g_mutex_unlock(&s->lock);
         return;
     }
     if (data[0]) {
         /* first byte nonzero: decryption failed upstream, same guard as the singleton render path */
+        g_mutex_unlock(&s->lock);
         logger_log(logger, LOGGER_ERR, "*** ERROR decryption of video packet failed (slot %d)", slot);
         return;
     }
@@ -803,6 +814,7 @@ void video_renderer_multi_client_push(int slot, unsigned char *data, int data_le
     }
     gst_buffer_fill(buffer, 0, data, data_len);
     gst_app_src_push_buffer(GST_APP_SRC(s->appsrc), buffer);
+    g_mutex_unlock(&s->lock);
 }
 
 void video_renderer_multi_client_stop(int slot) {
@@ -810,23 +822,35 @@ void video_renderer_multi_client_stop(int slot) {
         return;
     }
     multi_client_video_slot_t *s = &multi_client_video_slots[slot];
+    GstElement *pipeline = NULL;
+    GstElement *appsrc = NULL;
+    guint bus_watch_id = 0;
+
+    g_mutex_lock(&s->lock);
     if (!s->active) {
+        g_mutex_unlock(&s->lock);
         return;
     }
-    if (s->appsrc) {
-        gst_app_src_end_of_stream(GST_APP_SRC(s->appsrc));
-    }
-    if (s->pipeline) {
-        gst_element_set_state(s->pipeline, GST_STATE_NULL);
-        gst_object_unref(s->pipeline);
-    }
-    if (s->bus_watch_id) {
-        g_source_remove(s->bus_watch_id);
-        s->bus_watch_id = 0;
-    }
-    s->pipeline = NULL;
-    s->appsrc = NULL;
     s->active = false;
+    appsrc = s->appsrc;
+    pipeline = s->pipeline;
+    bus_watch_id = s->bus_watch_id;
+    s->appsrc = NULL;
+    s->pipeline = NULL;
+    s->bus_watch_id = 0;
+    g_mutex_unlock(&s->lock);
+
+    if (appsrc) {
+        gst_app_src_end_of_stream(GST_APP_SRC(appsrc));
+        gst_object_unref(appsrc);
+    }
+    if (pipeline) {
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+    }
+    if (bus_watch_id) {
+        g_source_remove(bus_watch_id);
+    }
 }
 
 void video_renderer_flush() {
