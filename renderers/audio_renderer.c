@@ -126,17 +126,6 @@ bool gstreamer_init(){
     return (bool) check_plugins ();
 }
 
-void audio_renderer_multi_client_init(logger_t *render_logger) {
-    logger = render_logger;
-    /* audio_renderer_init() (which normally detects these) never runs in multi-client
-     * mode -- detect here instead, so per-slot pipelines know which decoders they can use. */
-    aac = check_plugin_feature(avdec_aac);
-    alac = check_plugin_feature(avdec_alac);
-    for (int i = 0; i < VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS; i++) {
-        g_mutex_init(&multi_client_audio_slots[i].lock);
-    }
-}
-
 /* ===== Multi-client mirroring audio =====
  * One decode-then-re-encode-to-L16-RTP pipeline per concurrently connected client, mirroring
  * video_renderer_multi_client_* (see video_renderer.c). Unlike the singleton path's NFORMATS=2
@@ -148,6 +137,8 @@ typedef struct {
     bool active;
     unsigned char ct;
     guint bus_watch_id;
+    uint64_t generation;
+    uint64_t expected_generation;
     GMutex lock;
 } multi_client_audio_slot_t;
 
@@ -185,19 +176,34 @@ static gboolean multi_client_audio_bus_callback(GstBus *bus, GstMessage *message
     return TRUE;
 }
 
-int audio_renderer_multi_client_start(int slot, unsigned char ct, const char *rtp_pipeline_template, unsigned short port) {
+void audio_renderer_multi_client_init(logger_t *render_logger) {
+    logger = render_logger;
+    /* audio_renderer_init() (which normally detects these) never runs in multi-client
+     * mode -- detect here instead, so per-slot pipelines know which decoders they can use. */
+    aac = check_plugin_feature(avdec_aac);
+    alac = check_plugin_feature(avdec_alac);
+    for (int i = 0; i < VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS; i++) {
+        g_mutex_init(&multi_client_audio_slots[i].lock);
+    }
+}
+
+int audio_renderer_multi_client_start(int slot, uint64_t generation, unsigned char ct, const char *rtp_pipeline_template, unsigned short port) {
     if (slot < 0 || slot >= VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS) {
         return -1;
     }
     multi_client_audio_slot_t *s = &multi_client_audio_slots[slot];
     g_mutex_lock(&s->lock);
-    if (s->active && s->ct == ct) {
+    if (s->active && s->generation == generation && s->ct == ct) {
         g_mutex_unlock(&s->lock);
-        return 0; /* already running the right codec for this slot */
+        return 0; /* already running the right codec for this slot and generation */
     }
     g_mutex_unlock(&s->lock);
 
     audio_renderer_multi_client_stop(slot);
+
+    g_mutex_lock(&s->lock);
+    s->expected_generation = generation;
+    g_mutex_unlock(&s->lock);
 
     const char *decoder;
     const char *caps_str;
@@ -248,7 +254,8 @@ int audio_renderer_multi_client_start(int slot, unsigned char ct, const char *rt
     }
     g_string_free(pipeline_str, TRUE);
 
-    logger_log(logger, LOGGER_DEBUG, "GStreamer multi-client audio pipeline (slot %d):\n\"%s\"", slot, launch->str);
+    logger_log(logger, LOGGER_DEBUG, "GStreamer multi-client audio pipeline (slot %d, gen %llu):\n\"%s\"",
+               slot, (unsigned long long) generation, launch->str);
 
     GError *error = NULL;
     GstElement *pipeline = gst_parse_launch(launch->str, &error);
@@ -282,23 +289,33 @@ int audio_renderer_multi_client_start(int slot, unsigned char ct, const char *rt
     gst_element_set_state(pipeline, GST_STATE_PLAYING);
 
     g_mutex_lock(&s->lock);
+    if (s->expected_generation != generation) {
+        /* Teardown was called while pipeline was building -- discard and do not publish */
+        g_mutex_unlock(&s->lock);
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+        gst_object_unref(appsrc);
+        if (bus_watch_id) g_source_remove(bus_watch_id);
+        return -1;
+    }
     s->pipeline = pipeline;
     s->appsrc = appsrc;
     s->bus_watch_id = bus_watch_id;
     s->ct = ct;
+    s->generation = generation;
     s->active = true;
     g_mutex_unlock(&s->lock);
 
     return 0;
 }
 
-void audio_renderer_multi_client_push(int slot, unsigned char *data, int data_len, uint64_t ntp_time) {
+void audio_renderer_multi_client_push(int slot, uint64_t generation, unsigned char *data, int data_len, uint64_t ntp_time) {
     if (slot < 0 || slot >= VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS) {
         return;
     }
     multi_client_audio_slot_t *s = &multi_client_audio_slots[slot];
     g_mutex_lock(&s->lock);
-    if (!s->active || !s->appsrc || data_len <= 0) {
+    if (!s->active || s->generation != generation || !s->appsrc || data_len <= 0) {
         g_mutex_unlock(&s->lock);
         return;
     }
@@ -377,11 +394,13 @@ void audio_renderer_multi_client_stop(int slot) {
     guint bus_watch_id = 0;
 
     g_mutex_lock(&s->lock);
+    s->expected_generation = 0;
     if (!s->active) {
         g_mutex_unlock(&s->lock);
         return;
     }
     s->active = false;
+    s->generation = 0;
     appsrc = s->appsrc;
     pipeline = s->pipeline;
     bus_watch_id = s->bus_watch_id;

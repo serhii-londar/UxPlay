@@ -669,6 +669,8 @@ typedef struct {
     GstElement *pipeline;
     bool active;
     guint bus_watch_id;
+    uint64_t generation;
+    uint64_t expected_generation;
     GMutex lock;
 } multi_client_video_slot_t;
 
@@ -720,12 +722,17 @@ void video_renderer_multi_client_init(logger_t *render_logger) {
     }
 }
 
-int video_renderer_multi_client_start(int slot, const char *parser, const char *rtp_pipeline_template,
+int video_renderer_multi_client_start(int slot, uint64_t generation, const char *parser, const char *rtp_pipeline_template,
                                       unsigned short port, bool video_sync_enabled, bool video_is_h265) {
     if (slot < 0 || slot >= VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS) {
         return -1;
     }
+    multi_client_video_slot_t *s = &multi_client_video_slots[slot];
     video_renderer_multi_client_stop(slot);
+
+    g_mutex_lock(&s->lock);
+    s->expected_generation = generation;
+    g_mutex_unlock(&s->lock);
 
     /* the -vrtp template carries a %PORT% placeholder each slot substitutes with its own loopback port */
     gchar *port_str = g_strdup_printf("%u", port);
@@ -743,7 +750,8 @@ int video_renderer_multi_client_start(int slot, const char *parser, const char *
     g_string_append(launch, pipeline_str->str);
     g_string_free(pipeline_str, TRUE);
 
-    logger_log(logger, LOGGER_DEBUG, "GStreamer multi-client video pipeline (slot %d):\n\"%s\"", slot, launch->str);
+    logger_log(logger, LOGGER_DEBUG, "GStreamer multi-client video pipeline (slot %d, gen %llu):\n\"%s\"",
+               slot, (unsigned long long) generation, launch->str);
 
     GError *error = NULL;
     GstElement *pipeline = gst_parse_launch(launch->str, &error);
@@ -776,24 +784,33 @@ int video_renderer_multi_client_start(int slot, const char *parser, const char *
 
     gst_element_set_state(pipeline, GST_STATE_PLAYING);
 
-    multi_client_video_slot_t *s = &multi_client_video_slots[slot];
     g_mutex_lock(&s->lock);
+    if (s->expected_generation != generation) {
+        /* Teardown was called while pipeline was building -- discard and do not publish */
+        g_mutex_unlock(&s->lock);
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+        gst_object_unref(appsrc);
+        if (bus_watch_id) g_source_remove(bus_watch_id);
+        return -1;
+    }
     s->pipeline = pipeline;
     s->appsrc = appsrc;
     s->bus_watch_id = bus_watch_id;
+    s->generation = generation;
     s->active = true;
     g_mutex_unlock(&s->lock);
 
     return 0;
 }
 
-void video_renderer_multi_client_push(int slot, unsigned char *data, int data_len, uint64_t ntp_time) {
+void video_renderer_multi_client_push(int slot, uint64_t generation, unsigned char *data, int data_len, uint64_t ntp_time) {
     if (slot < 0 || slot >= VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS) {
         return;
     }
     multi_client_video_slot_t *s = &multi_client_video_slots[slot];
     g_mutex_lock(&s->lock);
-    if (!s->active || !s->appsrc) {
+    if (!s->active || s->generation != generation || !s->appsrc) {
         g_mutex_unlock(&s->lock);
         return;
     }
@@ -827,11 +844,13 @@ void video_renderer_multi_client_stop(int slot) {
     guint bus_watch_id = 0;
 
     g_mutex_lock(&s->lock);
+    s->expected_generation = 0;
     if (!s->active) {
         g_mutex_unlock(&s->lock);
         return;
     }
     s->active = false;
+    s->generation = 0;
     appsrc = s->appsrc;
     pipeline = s->pipeline;
     bus_watch_id = s->bus_watch_id;

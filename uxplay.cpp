@@ -2183,33 +2183,48 @@ static std::map<raop_ntp_t*, std::string> multi_client_ip_by_ntp;
 struct multi_client_dacp_info_t { std::string dacp_id; std::string active_remote; };
 static std::map<raop_ntp_t*, multi_client_dacp_info_t> multi_client_dacp_by_ntp;
 static bool multi_client_slot_busy[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = { false };
+static uint64_t multi_client_slot_generation[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = { 0 };
 static std::atomic<bool> multi_client_clock_offset_init[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = {};
+static std::atomic<uint64_t> multi_client_clock_offset_gen[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = {};
 static std::atomic<uint64_t> multi_client_clock_offset[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = {};
 
-static inline uint64_t get_or_init_client_clock_offset(int slot, uint64_t ntp_time_local, uint64_t ntp_time_remote) {
-    if (multi_client_clock_offset_init[slot].load(std::memory_order_acquire)) {
+static inline uint64_t get_or_init_client_clock_offset(int slot, uint64_t generation, uint64_t ntp_time_local, uint64_t ntp_time_remote) {
+    if (multi_client_clock_offset_init[slot].load(std::memory_order_acquire) &&
+        multi_client_clock_offset_gen[slot].load(std::memory_order_acquire) == generation) {
         return multi_client_clock_offset[slot].load(std::memory_order_relaxed);
     }
     std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
-    if (!multi_client_clock_offset_init[slot].load(std::memory_order_relaxed)) {
+    if (multi_client_slot_generation[slot] != generation) {
+        return 0;
+    }
+    if (!multi_client_clock_offset_init[slot].load(std::memory_order_relaxed) ||
+        multi_client_clock_offset_gen[slot].load(std::memory_order_relaxed) != generation) {
         uint64_t local_time = (ntp_time_local ? ntp_time_local : get_local_time());
         uint64_t new_offset = local_time - ntp_time_remote;
         multi_client_clock_offset[slot].store(new_offset, std::memory_order_relaxed);
+        multi_client_clock_offset_gen[slot].store(generation, std::memory_order_relaxed);
         multi_client_clock_offset_init[slot].store(true, std::memory_order_release);
     }
     return multi_client_clock_offset[slot].load(std::memory_order_relaxed);
 }
 
-static int multi_client_alloc_slot(raop_ntp_t *ntp) {
+static int multi_client_alloc_slot(raop_ntp_t *ntp, uint64_t *out_generation = nullptr) {
     std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
     auto it = multi_client_slot_by_ntp.find(ntp);
     if (it != multi_client_slot_by_ntp.end()) {
-        return it->second;
+        int slot = it->second;
+        if (out_generation) *out_generation = multi_client_slot_generation[slot];
+        return slot;
     }
     for (int i = 0; i < multi_client_max && i < VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS; i++) {
         if (!multi_client_slot_busy[i]) {
             multi_client_slot_busy[i] = true;
             multi_client_slot_by_ntp[ntp] = i;
+            multi_client_slot_generation[i]++;
+            multi_client_clock_offset_init[i].store(false, std::memory_order_release);
+            multi_client_clock_offset_gen[i].store(0, std::memory_order_relaxed);
+            multi_client_clock_offset[i].store(0, std::memory_order_relaxed);
+            if (out_generation) *out_generation = multi_client_slot_generation[i];
             return i;
         }
     }
@@ -2220,10 +2235,15 @@ static int multi_client_alloc_slot(raop_ntp_t *ntp) {
 // Read-only lookup for the call sites that only need to know a client's already-allocated
 // slot (audio_process/video_process/audio_reset) -- same mutex as alloc/release since it's
 // the same map.
-static int multi_client_lookup_slot(raop_ntp_t *ntp) {
+static int multi_client_lookup_slot(raop_ntp_t *ntp, uint64_t *out_generation = nullptr) {
     std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
     auto it = multi_client_slot_by_ntp.find(ntp);
-    return (it != multi_client_slot_by_ntp.end()) ? it->second : -1;
+    if (it != multi_client_slot_by_ntp.end()) {
+        int slot = it->second;
+        if (out_generation) *out_generation = multi_client_slot_generation[slot];
+        return slot;
+    }
+    return -1;
 }
 
 // Reverse of the above: used only by multi_client_disconnect_slot(), which is handed a
@@ -2290,6 +2310,10 @@ static void multi_client_release_slot(raop_ntp_t *ntp) {
         }
         slot = it->second;
         multi_client_slot_by_ntp.erase(it);
+        multi_client_slot_generation[slot]++;
+        multi_client_clock_offset_init[slot].store(false, std::memory_order_release);
+        multi_client_clock_offset_gen[slot].store(0, std::memory_order_relaxed);
+        multi_client_clock_offset[slot].store(0, std::memory_order_relaxed);
         // Note: Keep multi_client_slot_busy[slot] = true until renderers have stopped
         // to prevent another client connection from claiming the slot mid-teardown.
     }
@@ -2300,8 +2324,6 @@ static void multi_client_release_slot(raop_ntp_t *ntp) {
 
     {
         std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
-        multi_client_clock_offset_init[slot].store(false, std::memory_order_release);
-        multi_client_clock_offset[slot].store(0, std::memory_order_relaxed);
         multi_client_slot_busy[slot] = false;
     }
 
@@ -2415,14 +2437,15 @@ extern "C" int video_set_codec(void *cls, raop_ntp_t *ntp, video_codec_t codec) 
             LOGE("multi-client mode: client sent H265 but no -vrtp265 pipeline was configured, dropping connection");
             return -1;
         }
-        int slot = multi_client_alloc_slot(ntp);
+        uint64_t gen = 0;
+        int slot = multi_client_alloc_slot(ntp, &gen);
         if (slot < 0) {
             return -1;
         }
         unsigned short port = multi_client_base_port + (unsigned short) (slot * 2);
         const char *parser = video_is_h265 ? "h265parse" : video_parser.c_str();
         const char *pipeline_template = video_is_h265 ? rtp_pipeline_h265.c_str() : rtp_pipeline.c_str();
-        if (video_renderer_multi_client_start(slot, parser, pipeline_template, port, video_sync, video_is_h265) < 0) {
+        if (video_renderer_multi_client_start(slot, gen, parser, pipeline_template, port, video_sync, video_is_h265) < 0) {
             multi_client_release_slot(ntp);
             return -1;
         }
@@ -2589,14 +2612,15 @@ extern "C" void report_client_request(void *cls, char *deviceid, char * model, c
 
 extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *data) {
     if (multi_client_max > 0 && ntp) {
-        int slot = multi_client_lookup_slot(ntp);
+        uint64_t gen = 0;
+        int slot = multi_client_lookup_slot(ntp, &gen);
         if (slot < 0) {
             /* audio_get_format (which allocates the slot) hasn't run yet for this connection */
             return;
         }
-        uint64_t offset = get_or_init_client_clock_offset(slot, data->ntp_time_local, data->ntp_time_remote);
+        uint64_t offset = get_or_init_client_clock_offset(slot, gen, data->ntp_time_local, data->ntp_time_remote);
         data->ntp_time_remote = data->ntp_time_remote + offset;
-        audio_renderer_multi_client_push(slot, data->data, data->data_len, data->ntp_time_remote);
+        audio_renderer_multi_client_push(slot, gen, data->data, data->data_len, data->ntp_time_remote);
         return;
     }
     if (dump_audio) {
@@ -2635,14 +2659,15 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
 
 extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *data) {
     if (multi_client_max > 0 && ntp) {
-        int slot = multi_client_lookup_slot(ntp);
+        uint64_t gen = 0;
+        int slot = multi_client_lookup_slot(ntp, &gen);
         if (slot < 0) {
             /* video_set_codec (which allocates the slot) hasn't run yet for this connection */
             return;
         }
-        uint64_t offset = get_or_init_client_clock_offset(slot, data->ntp_time_local, data->ntp_time_remote);
+        uint64_t offset = get_or_init_client_clock_offset(slot, gen, data->ntp_time_local, data->ntp_time_remote);
         data->ntp_time_remote = data->ntp_time_remote + offset;
-        video_renderer_multi_client_push(slot, data->data, data->data_len, data->ntp_time_remote);
+        video_renderer_multi_client_push(slot, gen, data->data, data->data_len, data->ntp_time_remote);
         return;
     }
     if (dump_video) {
@@ -2789,10 +2814,11 @@ extern "C" void audio_get_format (void *cls, raop_ntp_t *ntp, unsigned char *ct,
     remote_clock_offset = 0;
 
     if (multi_client_max > 0 && ntp) {
-        int slot = multi_client_alloc_slot(ntp);
+        uint64_t gen = 0;
+        int slot = multi_client_alloc_slot(ntp, &gen);
         if (slot >= 0) {
             unsigned short port = multi_client_base_port + (unsigned short) (slot * 2) + 1;
-            if (audio_renderer_multi_client_start(slot, *ct, audio_rtp_pipeline.c_str(), port) < 0) {
+            if (audio_renderer_multi_client_start(slot, gen, *ct, audio_rtp_pipeline.c_str(), port) < 0) {
                 LOGE("multi-client audio slot %d: failed to start, audio disabled for this client", slot);
             } else {
                 printf("CLIENT_AUDIO_CONNECTED slot=%d audio_port=%u ct=%d\n", slot, port, (int) *ct);
