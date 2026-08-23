@@ -25,6 +25,7 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <winsock2.h>
 #include <windows.h>
 #define sleepms(x) Sleep(x)
 #define usleep(x) Sleep(((x) + 999) / 1000)

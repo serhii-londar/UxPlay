@@ -41,8 +41,9 @@ void audio_renderer_multi_client_init(logger_t *logger);
 /* Per-slot equivalent of audio_renderer_start/render_buffer/stop -- one decode+re-encode
  * pipeline per concurrently connected client, keyed by slot instead of the single shared
  * `renderer`. See video_renderer_multi_client_* for the video equivalent. */
-int audio_renderer_multi_client_start(int slot, unsigned char ct, const char *rtp_pipeline_template, unsigned short port);
-void audio_renderer_multi_client_push(int slot, unsigned char *data, int data_len, uint64_t ntp_time);
+int audio_renderer_multi_client_start(int slot, uint64_t generation, unsigned char ct, const char *rtp_pipeline_template, unsigned short port);
+void audio_renderer_multi_client_push(int slot, uint64_t generation, unsigned char *data, int data_len, uint64_t ntp_time);
+void audio_renderer_multi_client_stop_if_generation(int slot, uint64_t generation);
 void audio_renderer_multi_client_stop(int slot);
 void audio_renderer_start(unsigned char* compression_type);
 void audio_renderer_stop();

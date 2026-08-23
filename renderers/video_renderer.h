@@ -83,9 +83,9 @@ bool video_renderer_eos_watch();
  * (or instead of) the normal single-client renderer. */
 #define VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS 12
 void video_renderer_multi_client_init(logger_t *render_logger);
-int video_renderer_multi_client_start(int slot, const char *parser, const char *rtp_pipeline_template,
+int video_renderer_multi_client_start(int slot, uint64_t generation, const char *parser, const char *rtp_pipeline_template,
                                       unsigned short port, bool video_sync_enabled, bool video_is_h265);
-void video_renderer_multi_client_push(int slot, unsigned char *data, int data_len, uint64_t ntp_time);
+void video_renderer_multi_client_push(int slot, uint64_t generation, unsigned char *data, int data_len, uint64_t ntp_time);
 void video_renderer_multi_client_stop(int slot);
 
 void video_renderer_hls_set_volume(double volume);
