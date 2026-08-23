@@ -35,6 +35,7 @@ extern "C" {
 #include <stdint.h>
 #include <stdbool.h>
 #include "../lib/logger.h"
+#include "../lib/compat.h"
 
 typedef enum videoflip_e {
     NONE,

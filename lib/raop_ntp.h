@@ -22,6 +22,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <sys/types.h>
+#include "compat.h"
 #include "logger.h"
 
 typedef struct raop_ntp_s raop_ntp_t;

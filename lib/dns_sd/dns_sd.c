@@ -106,7 +106,7 @@ typedef const void * (DNSSD_STDCALL *TXTRecordGetBytesPtr_t)(const TXTRecordRef 
 
 
 typedef struct dnssd_private_s {
-#ifdef WIN32
+#if defined(WIN32) || defined(_WIN32)
     HMODULE module;
 #elif USE_LIBDL
     void *module;
@@ -156,7 +156,7 @@ dnssd_private_init(dnssd_t *dnssd_public, int *error)
         return NULL;
     }
 
-#ifdef WIN32
+#if defined(WIN32) || defined(_WIN32)
     dnssd->module = LoadLibraryA("dnssd.dll");
     if (!dnssd->module) {
         if (error) *error = DNSSD_ERROR_LIBNOTFOUND;
@@ -220,7 +220,7 @@ dnssd_private_destroy(void *private)
 {
     if (private) {
         dnssd_private_t *dnssd = (dnssd_private_t *) private;
-#ifdef WIN32
+#if defined(WIN32) || defined(_WIN32)
         FreeLibrary(dnssd->module);
 #elif USE_LIBDL
         dlclose(dnssd->module);

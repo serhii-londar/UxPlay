@@ -15,7 +15,7 @@
 #ifndef SOCKETS_H
 #define SOCKETS_H
 
-#if defined(WIN32)
+#if defined(WIN32) || defined(_WIN32)
 
 char *wsa_strerror(int errnum);
 

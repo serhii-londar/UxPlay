@@ -22,7 +22,9 @@
 
 #include <stddef.h>
 #include <cstring>
+#ifndef _WIN32
 #include <unistd.h>
+#endif
 #include <ctype.h>
 #include <string>
 #include <algorithm>
@@ -41,6 +43,7 @@
 #include <inttypes.h>
 
 #ifdef _WIN32  /*modifications for Windows compilation */
+#include <io.h>
 #include <glib.h>
 #include <unordered_map>
 #include <winsock2.h>
@@ -782,7 +785,11 @@ static const char *get_homedir() {
     if (homedir == NULL) {
         homedir = getenv("HOME");
     }
-#ifndef _WIN32
+#ifdef _WIN32
+    if (homedir == NULL) {
+        homedir = getenv("USERPROFILE");
+    }
+#else
     if (homedir == NULL){
         homedir = getpwuid(getuid())->pw_dir;
     }
@@ -1707,8 +1714,13 @@ static void parse_arguments (int argc, char *argv[]) {
                     exit(1);
                 }   
             } else {
-                dacpfile.append(get_homedir());
-                dacpfile.append("/.uxplay.dacp");
+                const char *homedir = get_homedir();
+                if (homedir) {
+                    dacpfile.append(homedir);
+                    dacpfile.append("/.uxplay.dacp");
+                } else {
+                    dacpfile.append(".uxplay.dacp");
+                }
             }
         } else if (arg == "-taper") {
             taper_volume = true;
@@ -2170,6 +2182,7 @@ static std::map<raop_ntp_t*, std::string> multi_client_ip_by_ntp;
 struct multi_client_dacp_info_t { std::string dacp_id; std::string active_remote; };
 static std::map<raop_ntp_t*, multi_client_dacp_info_t> multi_client_dacp_by_ntp;
 static bool multi_client_slot_busy[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = { false };
+static uint64_t multi_client_clock_offset[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = { 0 };
 
 static int multi_client_alloc_slot(raop_ntp_t *ntp) {
     std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
@@ -2261,6 +2274,7 @@ static void multi_client_release_slot(raop_ntp_t *ntp) {
         }
         slot = it->second;
         multi_client_slot_busy[slot] = false;
+        multi_client_clock_offset[slot] = 0;
         multi_client_slot_by_ntp.erase(it);
     }
     // Renderer teardown can take a while (GStreamer pipeline stop) -- do it outside the lock
@@ -2556,11 +2570,11 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
             /* audio_get_format (which allocates the slot) hasn't run yet for this connection */
             return;
         }
-        if (!remote_clock_offset) {
+        if (!multi_client_clock_offset[slot]) {
             uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
-            remote_clock_offset = local_time - data->ntp_time_remote;
+            multi_client_clock_offset[slot] = local_time - data->ntp_time_remote;
         }
-        data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
+        data->ntp_time_remote = data->ntp_time_remote + multi_client_clock_offset[slot];
         audio_renderer_multi_client_push(slot, data->data, data->data_len, data->ntp_time_remote);
         return;
     }
@@ -2605,11 +2619,11 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
             /* video_set_codec (which allocates the slot) hasn't run yet for this connection */
             return;
         }
-        if (!remote_clock_offset) {
+        if (!multi_client_clock_offset[slot]) {
             uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
-            remote_clock_offset = local_time - data->ntp_time_remote;
+            multi_client_clock_offset[slot] = local_time - data->ntp_time_remote;
         }
-        data->ntp_time_remote = data->ntp_time_remote + remote_clock_offset;
+        data->ntp_time_remote = data->ntp_time_remote + multi_client_clock_offset[slot];
         video_renderer_multi_client_push(slot, data->data, data->data_len, data->ntp_time_remote);
         return;
     }

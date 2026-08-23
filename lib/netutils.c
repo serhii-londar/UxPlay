@@ -34,7 +34,7 @@ static int peer_to_peer = 0;
 int
 netutils_init()
 {
-#ifdef WIN32
+#if defined(WIN32) || defined(_WIN32)
     WORD wVersionRequested;
 	WSADATA wsaData;
 	int ret;
@@ -57,7 +57,7 @@ netutils_init()
 void
 netutils_cleanup()
 {
-#ifdef WIN32
+#if defined(WIN32) || defined(_WIN32)
     WSACleanup();
 #endif
 }
