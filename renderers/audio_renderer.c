@@ -187,23 +187,54 @@ void audio_renderer_multi_client_init(logger_t *render_logger) {
     }
 }
 
+static void audio_renderer_multi_client_teardown_slot_for_start(
+    multi_client_audio_slot_t *s, uint64_t generation, unsigned char ct, GstElement **out_pipeline,
+    GstElement **out_appsrc, guint *out_bus_watch_id, bool *out_already_active) {
+    g_mutex_lock(&s->lock);
+    if (s->active && s->generation == generation && s->ct == ct) {
+        *out_already_active = true;
+        g_mutex_unlock(&s->lock);
+        return;
+    }
+    s->expected_generation = generation;
+    if (s->active) {
+        s->active = false;
+        s->generation = 0;
+        *out_appsrc = s->appsrc;
+        *out_pipeline = s->pipeline;
+        *out_bus_watch_id = s->bus_watch_id;
+        s->appsrc = NULL;
+        s->pipeline = NULL;
+        s->bus_watch_id = 0;
+    }
+    g_mutex_unlock(&s->lock);
+}
+
 int audio_renderer_multi_client_start(int slot, uint64_t generation, unsigned char ct, const char *rtp_pipeline_template, unsigned short port) {
     if (slot < 0 || slot >= VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS) {
         return -1;
     }
     multi_client_audio_slot_t *s = &multi_client_audio_slots[slot];
-    g_mutex_lock(&s->lock);
-    if (s->active && s->generation == generation && s->ct == ct) {
-        g_mutex_unlock(&s->lock);
+    GstElement *old_pipeline = NULL;
+    GstElement *old_appsrc = NULL;
+    guint old_bus_watch_id = 0;
+    bool already_active = false;
+    audio_renderer_multi_client_teardown_slot_for_start(
+        s, generation, ct, &old_pipeline, &old_appsrc, &old_bus_watch_id, &already_active);
+    if (already_active) {
         return 0; /* already running the right codec for this slot and generation */
     }
-    g_mutex_unlock(&s->lock);
-
-    audio_renderer_multi_client_stop(slot);
-
-    g_mutex_lock(&s->lock);
-    s->expected_generation = generation;
-    g_mutex_unlock(&s->lock);
+    if (old_appsrc) {
+        gst_app_src_end_of_stream(GST_APP_SRC(old_appsrc));
+        gst_object_unref(old_appsrc);
+    }
+    if (old_pipeline) {
+        gst_element_set_state(old_pipeline, GST_STATE_NULL);
+        gst_object_unref(old_pipeline);
+    }
+    if (old_bus_watch_id) {
+        g_source_remove(old_bus_watch_id);
+    }
 
     const char *decoder;
     const char *caps_str;
@@ -385,20 +416,25 @@ void audio_renderer_multi_client_push(int slot, uint64_t generation, unsigned ch
 }
 
 void audio_renderer_multi_client_stop(int slot) {
+    audio_renderer_multi_client_stop_if_generation(slot, 0);
+}
+
+void audio_renderer_multi_client_stop_if_generation(int slot, uint64_t generation) {
     if (slot < 0 || slot >= VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS) {
         return;
     }
+    bool force = (generation == 0);
     multi_client_audio_slot_t *s = &multi_client_audio_slots[slot];
     GstElement *pipeline = NULL;
     GstElement *appsrc = NULL;
     guint bus_watch_id = 0;
 
     g_mutex_lock(&s->lock);
-    s->expected_generation = 0;
-    if (!s->active) {
+    if (!s->active || (!force && s->generation != generation)) {
         g_mutex_unlock(&s->lock);
         return;
     }
+    s->expected_generation = 0;
     s->active = false;
     s->generation = 0;
     appsrc = s->appsrc;

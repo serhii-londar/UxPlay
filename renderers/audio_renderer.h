@@ -43,6 +43,7 @@ void audio_renderer_multi_client_init(logger_t *logger);
  * `renderer`. See video_renderer_multi_client_* for the video equivalent. */
 int audio_renderer_multi_client_start(int slot, uint64_t generation, unsigned char ct, const char *rtp_pipeline_template, unsigned short port);
 void audio_renderer_multi_client_push(int slot, uint64_t generation, unsigned char *data, int data_len, uint64_t ntp_time);
+void audio_renderer_multi_client_stop_if_generation(int slot, uint64_t generation);
 void audio_renderer_multi_client_stop(int slot);
 void audio_renderer_start(unsigned char* compression_type);
 void audio_renderer_stop();

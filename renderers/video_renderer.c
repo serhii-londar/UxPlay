@@ -722,17 +722,45 @@ void video_renderer_multi_client_init(logger_t *render_logger) {
     }
 }
 
+static void video_renderer_multi_client_teardown_slot_for_start(
+    multi_client_video_slot_t *s, uint64_t generation, GstElement **out_pipeline,
+    GstElement **out_appsrc, guint *out_bus_watch_id) {
+    g_mutex_lock(&s->lock);
+    s->expected_generation = generation;
+    if (s->active) {
+        s->active = false;
+        s->generation = 0;
+        *out_appsrc = s->appsrc;
+        *out_pipeline = s->pipeline;
+        *out_bus_watch_id = s->bus_watch_id;
+        s->appsrc = NULL;
+        s->pipeline = NULL;
+        s->bus_watch_id = 0;
+    }
+    g_mutex_unlock(&s->lock);
+}
+
 int video_renderer_multi_client_start(int slot, uint64_t generation, const char *parser, const char *rtp_pipeline_template,
                                       unsigned short port, bool video_sync_enabled, bool video_is_h265) {
     if (slot < 0 || slot >= VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS) {
         return -1;
     }
     multi_client_video_slot_t *s = &multi_client_video_slots[slot];
-    video_renderer_multi_client_stop(slot);
-
-    g_mutex_lock(&s->lock);
-    s->expected_generation = generation;
-    g_mutex_unlock(&s->lock);
+    GstElement *old_pipeline = NULL;
+    GstElement *old_appsrc = NULL;
+    guint old_bus_watch_id = 0;
+    video_renderer_multi_client_teardown_slot_for_start(s, generation, &old_pipeline, &old_appsrc, &old_bus_watch_id);
+    if (old_appsrc) {
+        gst_app_src_end_of_stream(GST_APP_SRC(old_appsrc));
+        gst_object_unref(old_appsrc);
+    }
+    if (old_pipeline) {
+        gst_element_set_state(old_pipeline, GST_STATE_NULL);
+        gst_object_unref(old_pipeline);
+    }
+    if (old_bus_watch_id) {
+        g_source_remove(old_bus_watch_id);
+    }
 
     /* the -vrtp template carries a %PORT% placeholder each slot substitutes with its own loopback port */
     gchar *port_str = g_strdup_printf("%u", port);

@@ -2847,10 +2847,11 @@ extern "C" void audio_get_format (void *cls, raop_ntp_t *ntp, unsigned char *ct,
  * same codec" no-op against a pipeline TEARDOWN already stopped feeding. */
 extern "C" void audio_reset(void *cls, raop_ntp_t *ntp) {
     if (multi_client_max > 0 && ntp) {
-        int slot = multi_client_lookup_slot(ntp);
+        uint64_t gen = 0;
+        int slot = multi_client_lookup_slot(ntp, &gen);
         if (slot >= 0) {
             LOGI("audio_reset: partial audio TEARDOWN, tearing down slot %d's audio pipeline", slot);
-            audio_renderer_multi_client_stop(slot);
+            audio_renderer_multi_client_stop_if_generation(slot, gen);
         }
     }
 }
