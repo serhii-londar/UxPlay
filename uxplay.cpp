@@ -31,6 +31,7 @@
 #include <vector>
 #include <map>
 #include <mutex>
+#include <atomic>
 #include <thread>
 #include <iostream>
 #include <fstream>
@@ -2182,7 +2183,22 @@ static std::map<raop_ntp_t*, std::string> multi_client_ip_by_ntp;
 struct multi_client_dacp_info_t { std::string dacp_id; std::string active_remote; };
 static std::map<raop_ntp_t*, multi_client_dacp_info_t> multi_client_dacp_by_ntp;
 static bool multi_client_slot_busy[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = { false };
-static uint64_t multi_client_clock_offset[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = { 0 };
+static std::atomic<uint64_t> multi_client_clock_offset[VIDEO_RENDERER_MAX_MULTI_CLIENT_SLOTS] = {};
+
+static inline uint64_t get_or_init_client_clock_offset(int slot, uint64_t ntp_time_local, uint64_t ntp_time_remote) {
+    uint64_t offset = multi_client_clock_offset[slot].load(std::memory_order_acquire);
+    if (!offset) {
+        uint64_t local_time = (ntp_time_local ? ntp_time_local : get_local_time());
+        uint64_t new_offset = local_time - ntp_time_remote;
+        uint64_t expected = 0;
+        if (multi_client_clock_offset[slot].compare_exchange_strong(expected, new_offset, std::memory_order_acq_rel)) {
+            offset = new_offset;
+        } else {
+            offset = expected;
+        }
+    }
+    return offset;
+}
 
 static int multi_client_alloc_slot(raop_ntp_t *ntp) {
     std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
@@ -2260,7 +2276,7 @@ static void stdin_command_thread_func() {
 /* Safe to call more than once for the same ntp (video_reset and conn_destroy can both
  * fire for one connection's teardown) -- second call is a no-op since the map entry is gone. */
 static void multi_client_release_slot(raop_ntp_t *ntp) {
-    int slot;
+    int slot = -1;
     {
         std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
         /* unconditional: a client that never reached video_set_codec (e.g. rejected for
@@ -2273,14 +2289,21 @@ static void multi_client_release_slot(raop_ntp_t *ntp) {
             return;
         }
         slot = it->second;
-        multi_client_slot_busy[slot] = false;
-        multi_client_clock_offset[slot] = 0;
         multi_client_slot_by_ntp.erase(it);
+        // Note: Keep multi_client_slot_busy[slot] = true until renderers have stopped
+        // to prevent another client connection from claiming the slot mid-teardown.
     }
     // Renderer teardown can take a while (GStreamer pipeline stop) -- do it outside the lock
     // so it doesn't block other clients' concurrent alloc/release/lookup calls.
     video_renderer_multi_client_stop(slot);
     audio_renderer_multi_client_stop(slot);
+
+    {
+        std::lock_guard<std::mutex> lock(multi_client_slot_mutex);
+        multi_client_clock_offset[slot].store(0, std::memory_order_release);
+        multi_client_slot_busy[slot] = false;
+    }
+
     printf("CLIENT_DISCONNECTED slot=%d\n", slot);
     fflush(stdout);
 }
@@ -2570,11 +2593,8 @@ extern "C" void audio_process (void *cls, raop_ntp_t *ntp, audio_decode_struct *
             /* audio_get_format (which allocates the slot) hasn't run yet for this connection */
             return;
         }
-        if (!multi_client_clock_offset[slot]) {
-            uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
-            multi_client_clock_offset[slot] = local_time - data->ntp_time_remote;
-        }
-        data->ntp_time_remote = data->ntp_time_remote + multi_client_clock_offset[slot];
+        uint64_t offset = get_or_init_client_clock_offset(slot, data->ntp_time_local, data->ntp_time_remote);
+        data->ntp_time_remote = data->ntp_time_remote + offset;
         audio_renderer_multi_client_push(slot, data->data, data->data_len, data->ntp_time_remote);
         return;
     }
@@ -2619,11 +2639,8 @@ extern "C" void video_process (void *cls, raop_ntp_t *ntp, video_decode_struct *
             /* video_set_codec (which allocates the slot) hasn't run yet for this connection */
             return;
         }
-        if (!multi_client_clock_offset[slot]) {
-            uint64_t local_time = (data->ntp_time_local ? data->ntp_time_local : get_local_time());
-            multi_client_clock_offset[slot] = local_time - data->ntp_time_remote;
-        }
-        data->ntp_time_remote = data->ntp_time_remote + multi_client_clock_offset[slot];
+        uint64_t offset = get_or_init_client_clock_offset(slot, data->ntp_time_local, data->ntp_time_remote);
+        data->ntp_time_remote = data->ntp_time_remote + offset;
         video_renderer_multi_client_push(slot, data->data, data->data_len, data->ntp_time_remote);
         return;
     }
