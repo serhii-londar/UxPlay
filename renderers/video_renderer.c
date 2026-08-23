@@ -736,7 +736,7 @@ int video_renderer_multi_client_start(int slot, const char *parser, const char *
     }
     g_free(port_str);
 
-    GString *launch = g_string_new("appsrc name=video_source ! queue ! ");
+    GString *launch = g_string_new("appsrc name=video_source ! queue max-size-buffers=1 max-size-bytes=0 max-size-time=0 leaky=downstream ! ");
     g_string_append(launch, parser);
     g_string_append(launch, video_is_h265 ? " ! rtph265pay " : " ! rtph264pay ");
     g_string_append(launch, pipeline_str->str);
