@@ -40,7 +40,7 @@ static gboolean alac = FALSE;
 static gboolean render_audio = FALSE;
 static gboolean async = FALSE;
 static gboolean vsync = FALSE;
-static gboolean sync = FALSE;
+static gboolean audio_pipeline_sync = FALSE;
 static gboolean audio_rtp = FALSE;
 
 typedef struct audio_renderer_s {
@@ -596,7 +596,7 @@ static void get_renderer_type(unsigned char *ct, int *id) {
         } else {
             logger_log(logger, LOGGER_INFO, "*** GStreamer libav plugin feature avdec_aac is missing, cannot decode AAC audio");
         }
-        sync = vsync;
+        audio_pipeline_sync = vsync;
         break;
     case 1:
         if (alac) {
@@ -604,11 +604,11 @@ static void get_renderer_type(unsigned char *ct, int *id) {
         } else {
             logger_log(logger, LOGGER_INFO, "*** GStreamer libav plugin feature avdec_alac is missing, cannot decode ALAC audio");
         }
-        sync = async;
+        audio_pipeline_sync = async;
         break;
     case 3:
         render_audio = TRUE;
-	sync = FALSE;
+	audio_pipeline_sync = FALSE;
         break;
     default:
         break;
@@ -644,7 +644,7 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
 
     GstClockTime pts = (GstClockTime) *ntp_time ;    /* now in nsecs */
     //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);
-    if (sync) {
+    if (audio_pipeline_sync) {
         if (pts >= gst_audio_pipeline_base_time) {
             pts -= gst_audio_pipeline_base_time;
         } else {
@@ -665,7 +665,7 @@ void audio_renderer_render_buffer(unsigned char* data, int *data_len, unsigned s
     buffer = gst_buffer_new_allocate(NULL, *data_len, NULL);
     g_assert(buffer != NULL);
     //g_print("audio latency %8.6f\n", (double) latency / SECOND_IN_NSECS);
-    if (sync) {
+    if (audio_pipeline_sync) {
         GST_BUFFER_PTS(buffer) = pts;
     }
     gst_buffer_fill(buffer, 0, data, *data_len);

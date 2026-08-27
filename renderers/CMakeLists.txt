@@ -86,8 +86,12 @@ if( GST_LIBRARY_DIRS MATCHES "/Library/FrameWorks/GStreamer.framework/lib" )
 elseif( CMAKE_VERSION VERSION_LESS "3.12" )
   target_link_libraries ( renderers  PUBLIC ${GST_LIBRARIES} )  
 else()		  
-  target_link_libraries( renderers PUBLIC ${GST_LINK_LIBRARIES} )
+  target_link_libraries( renderers PUBLIC ${GST_LIBRARIES} ${GST_LINK_LIBRARIES} )
+  target_link_directories( renderers PUBLIC ${GST_LIBRARY_DIRS} )
 endif()
+
+set(GST_LIBRARIES ${GST_LIBRARIES} PARENT_SCOPE)
+set(GST_LIBRARY_DIRS ${GST_LIBRARY_DIRS} PARENT_SCOPE)
 
 
 

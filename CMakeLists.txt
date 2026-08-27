@@ -126,8 +126,17 @@ if  ( GST_MACOS )
      message ( STATUS "define GST_MACOS" )
 endif()
 
+if( APPLE )
+  link_directories(
+    "/opt/homebrew/lib"
+    "/Library/Frameworks/GStreamer.framework/Libraries"
+    "/Library/Frameworks/GStreamer.framework/Versions/1.0/lib"
+    "/usr/local/lib"
+  )
+endif()
+
 add_executable( uxplay uxplay.cpp )
-target_link_libraries( uxplay renderers airplay )
+target_link_libraries( uxplay renderers airplay gstsdp-1.0 gstvideo-1.0 gstapp-1.0 gstbase-1.0 gstreamer-1.0 gobject-2.0 glib-2.0 intl )
 if (DBUS_FOUND)
       target_link_libraries( uxplay ${DBUS_LIBRARY})
 endif()

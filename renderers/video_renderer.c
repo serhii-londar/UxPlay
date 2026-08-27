@@ -38,7 +38,7 @@ static GstClockTime gst_video_pipeline_base_time = GST_CLOCK_TIME_NONE;
 static logger_t *logger = NULL;
 static unsigned short width, height, width_source, height_source;  /* not currently used */
 static bool first_packet = false;
-static bool sync = false;
+static bool video_pipeline_sync = false;
 static bool auto_videosink = true;
 static bool hls_video = false;
 #ifdef X_DISPLAY_FIX
@@ -388,10 +388,10 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
                 g_string_append(launch, videosink_options);
                 if (video_sync && !jpeg_pipeline) {
                     g_string_append(launch, " sync=true");
-                    sync = true;
+                    video_pipeline_sync = true;
                 } else {
                     g_string_append(launch, " sync=false");
-                    sync = false;
+                    video_pipeline_sync = false;
                 }
             }
             if (!strcmp(renderer_type[i]->codec, h264)) {
@@ -611,7 +611,7 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
     GstBuffer *buffer = NULL;
     GstClockTime pts = (GstClockTime) *ntp_time; /*now in nsecs */
     //GstClockTimeDiff latency = GST_CLOCK_DIFF(gst_element_get_current_clock_time (renderer->appsrc), pts);
-    if (sync) {
+    if (video_pipeline_sync) {
         if (pts >= gst_video_pipeline_base_time) {
             pts -= gst_video_pipeline_base_time;
         } else {
@@ -640,7 +640,7 @@ uint64_t video_renderer_render_buffer(unsigned char* data, int *data_len, int *n
         buffer = gst_buffer_new_allocate(NULL, *data_len, NULL);
         g_assert(buffer != NULL);
         //g_print("video latency %8.6f\n", (double) latency / SECOND_IN_NSECS);
-        if (sync) {
+        if (video_pipeline_sync) {
             GST_BUFFER_PTS(buffer) = pts;
         }
         gst_buffer_fill(buffer, 0, data, *data_len);
