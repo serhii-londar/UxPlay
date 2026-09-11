@@ -25,7 +25,11 @@ static void
         logger_log(raop->logger, LOGGER_ERR, "hls_get_current_video: failed to identify current_playlist");
         return NULL;
     }
-    assert(raop->airplay_video[raop->current_video]);
+    if (!raop->airplay_video[raop->current_video]) {
+        logger_log(raop->logger, LOGGER_ERR, "hls_get_current_video: current_playlist %d is empty",
+                   raop->current_video);
+        return NULL;
+    }
     return (void *) raop->airplay_video[raop->current_video];
 }
 
@@ -396,15 +400,21 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
                     char **response_data, int *response_datalen) {
 
     raop_t *raop = conn->raop;
-    airplay_video_t *airplay_video = (airplay_video_t *) hls_get_current_video(raop);
-    assert(airplay_video);
+    airplay_video_t *airplay_video = NULL;
     bool data_is_plist = false;
     plist_t req_root_node = NULL;
     uint64_t uint_val = 0;
     int request_id = 0;
     int fcup_response_statuscode = 0;
+    char *fcup_response_url = NULL;
     char *type = NULL;
     bool logger_debug = (logger_get_level(raop->logger) >= LOGGER_DEBUG);
+
+    /* fetched only after the locals above are initialized: post_action_error releases them */
+    airplay_video = (airplay_video_t *) hls_get_current_video(raop);
+    if (!airplay_video) {
+        goto post_action_error;
+    }
 
     const char* session_id = http_request_get_header(request, "X-Apple-Session-ID");
     if (!session_id) {
@@ -538,7 +548,6 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
         if (!PLIST_IS_STRING(req_params_fcup_response_url_node)) {
             goto post_action_error;
         }
-        char *fcup_response_url = NULL;
         plist_get_string_val(req_params_fcup_response_url_node, &fcup_response_url);
         if (!fcup_response_url) {
             goto post_action_error;
@@ -547,7 +556,6 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
 	
         plist_t req_params_fcup_response_data_node = plist_dict_get_item(req_params_node, "FCUP_Response_Data");
         if (!PLIST_IS_DATA(req_params_fcup_response_data_node)){
-            plist_mem_free(fcup_response_url);
             goto post_action_error;
         }
 
@@ -562,7 +570,6 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
         fcup_response_datalen = (int) uint_val;
         char *playlist = NULL;
         if (!fcup_response_data) {
-            plist_mem_free(fcup_response_url);
             goto post_action_error;
         } else {
             playlist = (char *) malloc(fcup_response_datalen + 1);
@@ -577,6 +584,11 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
 #endif
         }
         assert(playlist);
+        if (strncmp(playlist,"#EXTM3U\n", strlen("#EXTM3U\n"))) {
+            logger_log(raop->logger, LOGGER_ERR,"playlist is not a valid M3U8 playlist");
+            free(playlist);
+            goto  post_action_error;
+        }
         int playlist_len = strlen(playlist);
     
         if (logger_debug) {
@@ -641,6 +653,7 @@ http_handler_action(raop_conn_t *conn, http_request_t *request, http_response_t 
     return;
 
  post_action_error:;
+    plist_mem_free(fcup_response_url);
     http_response_init(response, "HTTP/1.1", 400, "Bad Request");
     plist_mem_free(type);
     if (req_root_node)  {
@@ -721,10 +734,14 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
     if (id >= 0) {
       //printf("====use EXISTING  airplay_video[%d] %p %s %s\n", id, raop->airplay_video[id], playback_uuid, get_playback_uuid(raop->airplay_video[id]));
         plist_mem_free(playback_uuid);
+        playback_uuid = NULL;
         plist_free(req_root_node);
+        req_root_node = NULL;
         raop->current_video = id;
         airplay_video = hls_get_current_video(raop);
-        assert(airplay_video);
+        if (!airplay_video) {
+            goto play_error;
+        }
         set_apple_session_id(airplay_video, apple_session_id, strlen(apple_session_id));
         float resume_pos = get_resume_position_seconds(airplay_video);
         float start_pos = get_start_position_seconds(airplay_video);
@@ -767,7 +784,10 @@ http_handler_play(raop_conn_t *conn, http_request_t *request, http_response_t *r
     raop->current_video = id;
     raop->airplay_video[id] = airplay_video_init(raop, raop->port, raop->lang, raop->lang_subtitles, raop->lang_system);
     airplay_video = hls_get_current_video(raop);
-    assert(airplay_video);
+    if (!airplay_video) {
+        plist_mem_free(playback_uuid);
+        goto play_error;
+    }
     set_apple_session_id(airplay_video, apple_session_id, strlen(apple_session_id));
     set_playback_uuid(airplay_video, playback_uuid, strlen(playback_uuid));
     plist_mem_free (playback_uuid);
@@ -902,7 +922,10 @@ http_handler_hls(raop_conn_t *conn,  http_request_t *request, http_response_t *r
         return;
     }
     airplay_video_t *airplay_video = (airplay_video_t *) hls_get_current_video(raop);
-    assert(airplay_video);
+    if (!airplay_video) {
+        http_response_init(response, "HTTP/1.1", 404, "Not Found");
+        return;
+    }
     if (!strcmp(url, "/master.m3u8")){
         char * master_playlist  = get_master_playlist(airplay_video);
         if (master_playlist) {
@@ -925,11 +948,15 @@ http_handler_hls(raop_conn_t *conn,  http_request_t *request, http_response_t *r
         float duration = 0.0f;
         char *media_playlist = get_media_playlist(airplay_video, &chunks, &duration, url);
         if (media_playlist) {
-            char *data  = adjust_yt_condensed_playlist(media_playlist);
-            *response_data = data;
-            *response_datalen = strlen(data);
-            logger_log(raop->logger, LOGGER_INFO,
-                       "Requested media_playlist %s has %5d chunks, total duration %9.3f secs", url, chunks, duration); 
+            char *data  = adjust_yt_condensed_playlist(media_playlist, chunks);
+            if (data) {
+                *response_data = data;
+                *response_datalen = strlen(data);
+                logger_log(raop->logger, LOGGER_INFO,
+                           "Requested media_playlist %s has %5d chunks, total duration %9.3f secs", url, chunks, duration);
+            } else {
+                logger_log(raop->logger, LOGGER_ERR,"requested media playlist %s rejected (invalid YT-EXT-CONDENSED-URL)", url); 
+            }	    
         } else {
             logger_log(raop->logger, LOGGER_ERR,"requested media playlist %s not found", url); 
         }

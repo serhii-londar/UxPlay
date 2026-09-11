@@ -33,9 +33,11 @@
 #include <mutex>
 #include <atomic>
 #include <thread>
-#include <iostream>
+#include <array>
 #include <fstream>
 #include <sstream>
+#include <iostream>
+#include <memory>
 #include <iterator>
 #include <sys/stat.h>
 #include <cstdio>
@@ -237,6 +239,28 @@ static bool dbus_last_message = false;
 static const char *reason_always = "mirroring client: inhibit always";
 static const char *reason_active = "actively receiving video";
 static float previous_hls_position = 0.0f;
+#endif
+
+#if defined(__APPLE__) && defined(UXPLAY_HAVE_APPLE_P2P)
+/* Helper function to execute a system command and capture output */
+struct PcloseDeleter {
+    void operator()(FILE* fp) const {
+        if (fp) pclose(fp);
+    }
+};
+
+static std::string execCommand(const std::string& cmd) {
+  std::array<char, 128> buffer;
+    std::string result;
+    std::unique_ptr<FILE, PcloseDeleter> pipe(popen(cmd.c_str(), "r"));
+    if (!pipe) {
+        return "";
+    }
+    while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
+        result += buffer.data();
+    }
+    return result;
+}
 #endif
 
 /* logging */
@@ -944,8 +968,8 @@ static void print_info (char *name) {
     printf("-scrsv n  Screensaver override n: 0=off 1=on while displaying video 2=always on\n");
     printf("-pin[xxxx]Use a 4-digit pin code to control client access (default: no)\n");
     printf("          default pin is random: optionally use fixed pin xxxx\n");
-    printf("-p2p      Advertise and accept AirPlay over Apple peer-to-peer (macOS)\n");
-    printf("          requires -pin; makes UxPlay visible to nearby Apple devices\n");
+    printf("-p2p      Advertise and accept AirPlay over Apple peer-to-peer (macOS only)\n");
+    printf("          uses a one-time pin; makes UxPlay visible to nearby Apple devices\n");
     printf("-reg [fn] Keep a register in $HOME/.uxplay.register to verify returning\n");
     printf("          client pin-registration; (option: use file \"fn\" for this)\n");
     printf("-pw [pwd] Require use of password to control client access;\n");
@@ -1361,14 +1385,21 @@ static void parse_arguments (int argc, char *argv[]) {
                 continue;
             }
             std::string value(argv[++i]);
-            if (value == "tcp") {
-                arg.append(" tcp");
-                if(!get_ports(3, arg, argv[++i], tcp)) exit(1);
-            } else if (value == "udp") {
-                arg.append( " udp");
-                if(!get_ports(3, arg, argv[++i], udp)) exit(1);
+            if (value == "tcp" || value == "udp") {
+                if (i == argc - 1 || argv[i + 1][0] == '-') {
+                    fprintf(stderr,"invalid \"-p %s\": missing second argument (ports must be specified after \"%s\") \n",
+                            argv[i], argv[i]);
+                    exit (1);
+                }
+                arg.append(" " + value);
+                unsigned short *ports = (value == "udp") ? udp : tcp;
+                if (!get_ports(3, arg, argv[++i], ports)) {
+                    exit(1);
+                }
             } else {
-                if(!get_ports(3, arg, argv[i], tcp)) exit(1);
+                if (!get_ports(3, arg, argv[i], tcp)) {
+                    exit(1);
+                }
                 for (int j = 0; j < 3; j++) {
                     udp[j] = tcp[j];
                 }
@@ -1473,6 +1504,7 @@ static void parse_arguments (int argc, char *argv[]) {
         } else if (arg == "-FPSdata") {
             show_client_FPS_data = true;
         } else if (arg == "-reset") {
+            if (!option_has_value(i, argc, arg, argv[i+1])) exit(1);
             /* now using feedback  (every 1 sec ) instead of ntp timeouts (every 3 secs) to detect offline client and reset connections */
             fprintf(stderr,"*** NOTE CHANGE: -reset n now means reset n seconds (not 3n seconds) after client goes offline\n");	  
             missed_feedback_limit = 0;
@@ -1659,13 +1691,35 @@ static void parse_arguments (int argc, char *argv[]) {
             if (i < argc - 1 && *argv[i+1] != '-') {
                 unsigned int n = 9999;
                 if (!get_value(argv[++i], &n)) {
-                    fprintf(stderr, "invalid \"-pin %s\"; -pin nnnn : max nnnn=9999, (4 digits)\n", argv[i]);
+                    fprintf(stderr, "invalid \"-pin %s\"; -pin nnnn : nnnn range [0001:9999], (4 digits)\n", argv[i]);
                     exit(1);
                 }
                 pin = n + 10000;
             }
-	} else if (arg == "-p2p") {
-            peer_to_peer = true;
+        } else if (arg == "-p2p") {
+#if defined(__APPLE__) && defined(UXPLAY_HAVE_APPLE_P2P)
+            LOGI("macOS  point-to-point Airplay settings are in System Settings->General->AirDrop & Continuity->AirPlay->AirPlayReceiver"); 
+	    std::string command  = "defaults -currentHost read com.apple.controlcenter AirplayReceiverEnabled 2>/dev/null";
+            std::string output = execCommand(command.c_str());
+            output.erase(output.find_last_not_of(" \n\r\t") + 1);
+            if (output == "1" || output == "true") {
+	        LOGI(" macOS host reported AirplayReceiverEnabled is true");
+                peer_to_peer = true;
+                setup_legacy_pairing = true;
+                pin_pw = 1;
+	    } else {
+		if (output == "0" || output == "false") {
+                    LOGE(" macOS host reported AirplayReceiverEnabled was not true");
+		} else {
+                    LOGE(" macOS host did not report a value for AirplayReceiverEnabled; try switching AirPlay Receiver off then on");
+		}
+		exit(1);
+	    }
+#else
+	    fprintf(stderr, "invalid: the \"-p2p\" option is only available on macOS hosts with UxPlay compiled to use Bonjour services\n");      
+            exit(1);
+#endif
+	    
 	} else if (arg == "-reg") {
             registration_list = true;
             pairing_register.erase();
@@ -1675,7 +1729,7 @@ static void parse_arguments (int argc, char *argv[]) {
                 if (!file_has_write_access(fn)) {
                     fprintf(stderr, "%s cannot be written to:\noption \"-reg <fn>\" must be to a file with write access\n", fn);
                     exit(1);
-                }   
+      }   
             }
         } else if (arg == "-key") {
             keyfile.erase();
@@ -1728,21 +1782,27 @@ static void parse_arguments (int argc, char *argv[]) {
         } else if (arg == "-db") {
             bool db_bad = true;
             double db1, db2;
-            if ( i < argc -1) {
-                char *end1, *end2;
-                db1 = strtod(argv[i+1], &end1);
-                if (*end1 == ':') {
-                    db2 = strtod(++end1, &end2);
-                    if ( *end2 == '\0' && end2 > end1  && db1 < 0 && db1 < db2) {
-                        db_bad = false;
-                    }
-                } else  if (*end1 =='\0' && db1 < 0 ) {
+            if (i == argc - 1) {
+                fprintf(stderr,"invalid \"%s\": this option requires a value\n", argv[i]) ;
+                exit(1);
+            }
+            char *end1, *end2;
+            db1 = strtod(argv[i+1], &end1);
+            if (db1 >= 0.0) {
+                fprintf(stderr,"invalid \"%s\": this option requires a value\n", argv[i]) ;
+	        exit(1);
+            }
+            if (*end1 == ':') {
+                db2 = strtod(++end1, &end2);
+                if ( *end2 == '\0' && end2 > end1 && db1 < db2) {
                     db_bad = false;
-                    db2 = 0.0;
                 }
+            } else  if (*end1 =='\0') {
+                db_bad = false;
+                db2 = 0.0;
             }
             if (db_bad) {
-                fprintf(stderr, "invalid \"-db  %s\": db value must be \"low\" or \"low:high\", low < 0 and high > low are decibel gains\n", argv[i+1]); 
+                fprintf(stderr, "invalid \"-db  %s\": db value must be \"low\" or \"low:high\", low < 0 and high > low are decibel gains\n", argv[i+1]);
                 exit(1);
             }
             i++;
@@ -1750,11 +1810,16 @@ static void parse_arguments (int argc, char *argv[]) {
             db_high = db2;
             printf("db range %f:%f\n", db_low, db_high);
         } else if (arg ==  "-vol") {
+            if (!option_has_value(i, argc, arg, argv[i+1])) {
+                exit(1);
+            }
             bool vol_bad = true;
             if (i < argc - 1) {
                 char *end;
                 double frac = strtod(argv[i+1], &end);
-                if (*end == '\0' && frac >= 0.0 && frac <= 1.0) {
+                /* end != argv[i+1]: strtod("") returns 0.0 and leaves *end == 0, so an
+                   EMPTY value passed the old test and was silently taken as mute. */
+                if (end != argv[i+1] && *end == '\0' && frac >= 0.0 && frac <= 1.0) {
                     if (frac == 0.0) {
                         initial_volume = -144.0;
                     } else if (frac == 1.0) {
@@ -1766,12 +1831,16 @@ static void parse_arguments (int argc, char *argv[]) {
                         //db = (db > db_flat) ? db : db_flat;
                         initial_volume = db_flat;
                     }
+                    /* Both of these were outside the validity test, so any value
+                       was accepted: "-vol -h265" left the volume at its default,
+                       reported no error, and the i++ below then swallowed
+                       "-h265". */
+                    printf("initial_volume attenuation %f db\n", initial_volume);
+                    vol_bad = false;
                 }
-                printf("initial_volume attenuation %f db\n", initial_volume);
-                vol_bad = false;
             }
             if (vol_bad) {
-                fprintf(stderr, "invalid \"-vol %s\", value must be between 0.0 (mute) and 1.0 (full volume)\n", argv[i+1]);
+                fprintf(stderr, "invalid \"-vol %s\", value must be between 0.0 (mute) and 1.0 (full volume)\n", argv[i+1]);  
                 exit(1);
             }
             i++;
@@ -1779,7 +1848,7 @@ static void parse_arguments (int argc, char *argv[]) {
             hls_support = true;
             if (i < argc - 1 && *argv[i+1] != '-') {
                 unsigned int n = 3;
-                if (!get_value(argv[++i], &n) || playbin_version < 2) {
+                if (!get_value(argv[++i], &n) || n < 2) {
                     fprintf(stderr, "invalid \"-hls %s\"; -hls n only allows \"playbin\" video player versions 2 or 3\n", argv[i]);
                     exit(1);
                 }
@@ -2031,10 +2100,10 @@ static int start_dnssd(std::vector<char> hw_addr, std::string name) {
         return 2;
     }
     /* pin_pw controls client access
-      pin_pw  = 1: client must enter pin displayed onscreen (first access only)
+       pin_pw = 1: client must enter pin displayed onscreen (first access only, remembered by client, coupled to UxPlay's deviceID)
               = 2: client must enter password (same password for all clients)
-              = 3: client must enter randoe 4-digit password displayed like an  onscreen pin (every access)
-              = 0:  no access control
+              = 3: client must enter randomly selected 4-digit password displayed like an on-screen pin (every access)
+              = 0: no access control
     */
     dnssd = dnssd_init(name.c_str(), strlen(name.c_str()), hw_addr.data(), hw_addr.size(), pin_pw, &dnssd_error);
     if (dnssd_error) {
@@ -2043,6 +2112,11 @@ static int start_dnssd(std::vector<char> hw_addr, std::string name) {
     }
     dnssd_set_peer_to_peer(dnssd, (int) peer_to_peer);
 
+#if defined(__APPLE__) && defined(UXPLAY_HAVE_APPLE_P2P)
+    /* support for p2p (macOS only) */
+    dnssd_set_peer_to_peer(dnssd, (int) peer_to_peer);
+#endif
+    
     /* after dnssd starts, reset the default feature set here 
      * (overwrites features set in dnssdint.h)
      * default: FEATURES_1 = 0x5A7FFEE6, FEATURES_2 = 0 */
@@ -3250,7 +3324,7 @@ static void read_config_file(const char * filename, const char * uxplay_name) {
     if (options.size() > 1) {
 
         int argc = options.size();
-        char **argv = (char **) malloc(sizeof(char*) * argc);
+        char **argv = (char **) malloc(sizeof(char*) * (argc + 1));
         if (argv == NULL) {
             printf("Memory allocation failure (argV)\n");
             exit(1);
@@ -3258,6 +3332,9 @@ static void read_config_file(const char * filename, const char * uxplay_name) {
         for (int i = 0; i < argc; i++) {
             argv[i] = (char *) options[i].c_str();
         }
+        /* add an extra NULL option to terminate the simulated argv list
+           (as protection if argv[++i] is referenced when i = argc -1) */
+        argv[argc] = NULL;
         parse_arguments (argc, argv);
         free (argv);
     }
@@ -3340,17 +3417,12 @@ int main (int argc, char *argv[]) {
     }
     parse_arguments (argc, argv);
 
+#if !defined(__APPLE__) || !defined(UXPLAY_HAVE_APPLE_P2P)
     if (peer_to_peer) {
-#ifndef UXPLAY_HAVE_APPLE_P2P
         fprintf(stderr, "option -p2p requires macOS and the Apple Bonjour DNS-SD backend\n");
         exit(1);
-#endif
-        if (!setup_legacy_pairing) {
-            fprintf(stderr, "option -p2p requires -pin [nnnn] for the tested legacy-pairing path\n");
-            exit(1);
-        }
     }
-
+#endif
     log_level = (debug_log ? LOGGER_DEBUG_DATA : LOGGER_INFO);
     if (debug_log && suppress_packet_debug_data) {
         log_level = LOGGER_DEBUG;

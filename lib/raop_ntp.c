@@ -65,7 +65,7 @@ struct raop_ntp_s {
     int64_t sync_offset;
     int64_t sync_dispersion;
     int64_t sync_delay;
-    raop_ntp_session_t *ntp_session;
+    kernel_timestamp_session_t *ntp_session;
 
     // Socket address of the AirPlay client
     struct sockaddr_storage remote_saddr;
@@ -106,8 +106,8 @@ void raop_ntp_global_init(void) {
 #endif
 }
 
-raop_ntp_session_t* raop_ntp_session_create(int sock_fd) {
-    raop_ntp_session_t *session = (raop_ntp_session_t*)calloc(1, sizeof(raop_ntp_session_t));
+kernel_timestamp_session_t* kernel_timestamp_session_create(int sock_fd) {
+    kernel_timestamp_session_t *session = (kernel_timestamp_session_t*)calloc(1, sizeof(kernel_timestamp_session_t));
     if (!session) return NULL;
     session->sock_fd = sock_fd;
 
@@ -142,11 +142,6 @@ raop_ntp_session_t* raop_ntp_session_create(int sock_fd) {
     session->pWSARecvMsg_ptr = NULL;
     #endif
 #else
-    // POSIX path: Grab immediate time baseline (only used if kernel parsing falls back)
-    struct timeval tv_start;
-    gettimeofday(&tv_start, NULL);
-    session->base_system_time_us = ((uint64_t)tv_start.tv_sec * 1000000ULL) + (uint64_t)tv_start.tv_usec;
-
     // Enable POSIX kernel tracking explicitly on this isolated file descriptor
     int enable_ts = 1;
     setsockopt(sock_fd, SOL_SOCKET, SO_TIMESTAMP, (const char*)&enable_ts, sizeof(enable_ts));
@@ -154,18 +149,35 @@ raop_ntp_session_t* raop_ntp_session_create(int sock_fd) {
     return session;
 }
 
-ssize_t raop_ntp_session_recv(raop_ntp_session_t *session, char *buf, size_t buf_len, uint64_t *out_local_us) {
+ssize_t kernel_timestamp_session_recv(kernel_timestamp_session_t *session, char *buf, size_t buf_len, 
+                                      uint64_t *out_local_us, void *src_addr, int *addrlen) {
     if (!session || !buf || buf_len == 0 || !out_local_us) return -1;
 
 #ifdef _WIN32
-    #if defined(SIO_TIMESTAMPING)  //UCRT64 only
+#if defined(SIO_TIMESTAMPING) //not defined in legacy MSVCRT systems such as MSYS2 MINGW64
     LPFN_WSARECVMSG pWSARecvMsg = (LPFN_WSARECVMSG)session->pWSARecvMsg_ptr;
     if (pWSARecvMsg != NULL) {
         WSABUF wsa_buf = { .len = (ULONG)buf_len, .buf = buf };
-        char control_buf[WSA_CMSG_SPACE(sizeof(UINT64))];
-        WSAMSG wsa_msg = { .lpBuffers = &wsa_buf, .dwBufferCount = 1, .Control.len = sizeof(control_buf), .Control.buf = control_buf };
+
+        // Union forces strict compiler alignment bounds for Windows control frames
+        union {
+            char buf[WSA_CMSG_SPACE(sizeof(UINT64)) + 32];
+            struct cmsghdr align;
+        } control_un;
+	
+        struct sockaddr_storage win_remote_addr = {0};
+        INT win_addr_len = sizeof(win_remote_addr);
+
+        WSAMSG wsa_msg = {
+            .name = (LPSOCKADDR)&win_remote_addr,
+            .namelen = win_addr_len,
+            .lpBuffers = &wsa_buf,
+            .dwBufferCount = 1,
+            .Control.len = sizeof(control_un.buf),
+            .Control.buf = control_un.buf
+        };
+
         DWORD bytes_received = 0;
-        
         if (pWSARecvMsg((SOCKET)session->sock_fd, &wsa_msg, &bytes_received, NULL, NULL) != SOCKET_ERROR) {
             LARGE_INTEGER qpc_now;
             QueryPerformanceCounter(&qpc_now);
@@ -184,47 +196,85 @@ ssize_t raop_ntp_session_recv(raop_ntp_session_t *session, char *buf, size_t buf
                 }
                 cmsg = WSA_CMSG_NXTHDR(&wsa_msg, cmsg);
             }
+
+            if (src_addr && addrlen) {
+                int copy_len = (wsa_msg.namelen < *addrlen) ? wsa_msg.namelen : *addrlen;
+                memcpy(src_addr, wsa_msg.name, copy_len);
+                *addrlen = wsa_msg.namelen;
+            }
+
             return (ssize_t)bytes_received;
         }
     }
-    #endif
-    //fallback path if kernel timestamp could not be extracted; also used on MINGW64 systems
-    int from_len = sizeof(struct sockaddr_in);
-    struct sockaddr_in client_addr;
-    ssize_t n = recvfrom((SOCKET)session->sock_fd, buf, (int)buf_len, 0, (struct sockaddr*)&client_addr, &from_len);
+#endif
+    //Windows fallback path if kernel timestamp could not be extracted; also used on MINGW64 systems
+    int from_len = (src_addr && addrlen) ? *addrlen : sizeof(struct sockaddr_storage);
+    struct sockaddr_storage fallback_addr = {0};
     
+    ssize_t n = recvfrom((SOCKET)session->sock_fd, buf, (int)buf_len, 0, 
+                         src_addr ? (struct sockaddr*)src_addr : (struct sockaddr*)&fallback_addr, &from_len);
+    
+    if (n >= 0 && addrlen) {
+        *addrlen = from_len;
+    }
+
     LARGE_INTEGER qpc_now;
     QueryPerformanceCounter(&qpc_now);
     int64_t elapsed_ticks = qpc_now.QuadPart - session->base_qpc_ticks;
     *out_local_us = session->base_system_time_us + ((elapsed_ticks * 1000000LL) / session->qpc_frequency);
     return n;
-#else
-    struct sockaddr_in client_addr;
+
+#else // non-Windows POSIX path
+    struct sockaddr_storage remote_addr = {0};
     struct iovec iov = { .iov_base = buf, .iov_len = buf_len };
-    char control_buf[CMSG_SPACE(sizeof(struct timeval))];
+
+ // Allocate a union to guarantee strict alignment requirements for the buffer
+    union {
+        char buf[CMSG_SPACE(sizeof(struct timeval)) + 64]; // Padded safely
+        struct cmsghdr align;
+    } control_un;
+    
     struct msghdr msg = {
-        .msg_name = &client_addr, .msg_namelen = sizeof(client_addr),
-        .msg_iov = &iov, .msg_iovlen = 1,
-        .msg_control = control_buf, .msg_controllen = sizeof(control_buf)
+        .msg_name = &remote_addr,
+        .msg_namelen = sizeof(remote_addr),
+        .msg_iov = &iov,
+        .msg_iovlen = 1,
+        .msg_control = control_un.buf,
+        .msg_controllen = sizeof(control_un.buf)
     };
+
     ssize_t n = recvmsg(session->sock_fd, &msg, 0);
     if (n < 0) return n;
+
+    // immediate fallback time 
     struct timeval tv_now;
     gettimeofday(&tv_now, NULL);
     *out_local_us = ((uint64_t)tv_now.tv_sec * 1000000ULL) + (uint64_t)tv_now.tv_usec;
-    struct cmsghdr *cmsg;
-    for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-        if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SO_TIMESTAMP) {
-            struct timeval *tv_kernel = (struct timeval *)CMSG_DATA(cmsg);
-            *out_local_us = ((uint64_t)tv_kernel->tv_sec * 1000000ULL) + (uint64_t)tv_kernel->tv_usec;
-            break;
+
+    // Safety constraint to prevent parsing broken packets truncated by kernel boundaries
+    if (!(msg.msg_flags & MSG_CTRUNC)) {
+        struct cmsghdr *cmsg;
+        for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+            // Unified parsing identifier macro (SCM_TIMESTAMP handles cross-platform (Linux and macOS/*BSD definitions)
+            if (cmsg->cmsg_level == SOL_SOCKET && cmsg->cmsg_type == SCM_TIMESTAMP) {
+                struct timeval *tv_kernel = (struct timeval *)CMSG_DATA(cmsg);
+                *out_local_us = ((uint64_t)tv_kernel->tv_sec * 1000000ULL) + (uint64_t)tv_kernel->tv_usec;
+                break;
+            }
         }
     }
+
+    if (src_addr && addrlen) {
+        int copy_len = ((int)msg.msg_namelen < *addrlen) ? (int)msg.msg_namelen : *addrlen;
+        memcpy(src_addr, msg.msg_name, copy_len);
+        *addrlen = (int)msg.msg_namelen; 
+    }
+
     return n;
 #endif
 }
 
-void raop_ntp_session_destroy(raop_ntp_session_t *ntp_session) {
+void kernel_timestamp_session_destroy(kernel_timestamp_session_t *ntp_session) {
     if (ntp_session) {
         CLOSESOCKET(ntp_session->sock_fd);
         free(ntp_session);
@@ -356,7 +406,7 @@ raop_ntp_init_socket(raop_ntp_t *raop_ntp, int use_ipv6)
         goto sockets_cleanup;
     }
 
-    raop_ntp->ntp_session = raop_ntp_session_create(tsock);
+    raop_ntp->ntp_session = kernel_timestamp_session_create(tsock);
     if (raop_ntp->ntp_session == NULL) {
         logger_log(raop_ntp->logger, LOGGER_ERR, "raop_ntp: Failed to allocate high-precision session context");
         goto sockets_cleanup;
@@ -387,7 +437,7 @@ raop_ntp_init_socket(raop_ntp_t *raop_ntp, int use_ipv6)
 
     sockets_cleanup:
     if (raop_ntp->ntp_session != NULL) {
-        raop_ntp_session_destroy(raop_ntp->ntp_session);
+        kernel_timestamp_session_destroy(raop_ntp->ntp_session);
         raop_ntp->ntp_session = NULL;
     } else if (tsock != -1) {
         // Fallback to protect if the handle crashed out before session instantiation
@@ -465,8 +515,8 @@ raop_ntp_thread(void *arg)
         } else {
             // Read response
             uint64_t kernel_recv_time_microsecs;   // kernel recv timestamp in microsecs
-            response_len = raop_ntp_session_recv(raop_ntp->ntp_session, (char *) response, sizeof(response),
-                                                 &kernel_recv_time_microsecs);
+            response_len = kernel_timestamp_session_recv(raop_ntp->ntp_session, (char *) response, sizeof(response),
+                                                         &kernel_recv_time_microsecs, NULL, NULL);
             if (response_len < 0) {
                 char time[30];
                 ntp_timestamp_to_time(send_time, time, sizeof(time));
@@ -615,7 +665,7 @@ raop_ntp_stop(raop_ntp_t *raop_ntp)
     THREAD_JOIN(raop_ntp->thread);
 
     if (raop_ntp->ntp_session != NULL) {
-        raop_ntp_session_destroy(raop_ntp->ntp_session);
+        kernel_timestamp_session_destroy(raop_ntp->ntp_session);
         raop_ntp->ntp_session = NULL;
         raop_ntp->tsock = -1; 
     } else if (raop_ntp->tsock != -1) {

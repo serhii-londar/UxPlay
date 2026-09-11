@@ -367,10 +367,10 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
             logger_log(raop->logger, LOGGER_DEBUG, "client SRP6a proof <M> :\n%s", str);	    
             free (str);
         }
-        memcpy(proof, client_proof, (int) client_proof_len);
+        memcpy(proof, client_proof, sizeof(proof));
         free (client_proof);
         int ret = srp_validate_proof(conn->session, raop->pairing, (const unsigned char *) client_pk,
-                                     (int) client_pk_len, proof, (int) client_proof_len, (int) sizeof(proof));
+                                     (int) client_pk_len, proof, (int) sizeof(proof));
         free (client_pk);
         plist_free(req_root_node);
         if (ret < 0) {
@@ -841,14 +841,15 @@ raop_handler_setup(raop_conn_t *conn,
             free(str);
         }
 
-        const char *user_agent = http_request_get_header(request, "User-Agent");
-        logger_log(raop->logger, LOGGER_INFO, "Client identified as User-Agent: %s", user_agent);	
-
         bool old_protocol = false;
+        const char *user_agent = http_request_get_header(request, "User-Agent");
+        if (user_agent) {
+            logger_log(raop->logger, LOGGER_INFO, "Client identified as User-Agent: %s", user_agent);	
 #ifdef OLD_PROTOCOL_CLIENT_USER_AGENT_LIST    /* set in global.h */
-        if (strstr(OLD_PROTOCOL_CLIENT_USER_AGENT_LIST, user_agent)) old_protocol = true;
-        if (strstr(user_agent, "AirMyPC")) old_protocol = true;   //AirMyPC/7200 still uses old protocol: unlikely to change (?)
+            if (strstr(OLD_PROTOCOL_CLIENT_USER_AGENT_LIST, user_agent)) old_protocol = true;
+            if (strstr(user_agent, "AirMyPC")) old_protocol = true;   //AirMyPC/7200 still uses old protocol: unlikely to change (?)
 #endif
+        }	
         if  (old_protocol) {    /* some windows AirPlay-client emulators use old AirPlay 1 protocol with unhashed AES key */
             logger_log(raop->logger, LOGGER_INFO, "Client identifed as using old protocol (unhashed) AES audio key)");
         } else {
@@ -1245,10 +1246,12 @@ raop_handler_audiomode(raop_conn_t *conn,
     plist_from_bin(data, data_len, &req_root_node);
     plist_t req_audiomode_node = plist_dict_get_item(req_root_node, "audioMode");
     plist_get_string_val(req_audiomode_node, &audiomode);
-    /* not sure what should be done with this request: usually audioMode requested is "default" */
-    int log_level = (strstr(audiomode, "default") ? LOGGER_DEBUG : LOGGER_INFO);
-    logger_log(raop->logger, log_level, "Unhandled RTSP request \"audioMode: %s\"", audiomode);
-    plist_mem_free(audiomode);
+    if (audiomode) {
+        /* not sure what should be done with this request: usually audioMode requested is "default" */
+        int log_level = (strstr(audiomode, "default") ? LOGGER_DEBUG : LOGGER_INFO);
+        logger_log(raop->logger, log_level, "Unhandled RTSP request \"audioMode: %s\"", audiomode);
+        plist_mem_free(audiomode);
+    }
     plist_free(req_root_node);
 }
 
@@ -1371,6 +1374,8 @@ raop_handler_teardown(raop_conn_t *conn,
         if (conn->raop_rtp_mirror) {
             raop_rtp_mirror_destroy(conn->raop_rtp_mirror);
             conn->raop_rtp_mirror = NULL;
+            /*fix for iOS >= 27 (does not send teardown_110 when mirrroring is stopped) */
+            raop->callbacks.video_reset(raop->callbacks.cls, conn->raop_ntp, RESET_TYPE_RTP_SHUTDOWN);
         }
         /* shut down any HLS connections */
         int hls_count = httpd_count_connection_type(raop->httpd, CONNECTION_TYPE_HLS);
