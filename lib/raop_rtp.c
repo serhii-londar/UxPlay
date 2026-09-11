@@ -247,6 +247,11 @@ raop_rtp_init_sockets(raop_rtp_t *raop_rtp, int use_ipv6)
         goto sockets_cleanup;
     }
 
+    /* Set 512KB receive buffer on audio UDP sockets to prevent packet drops under load */
+    int rcvbuf = 512 * 1024;
+    setsockopt(csock, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
+    setsockopt(dsock, SOL_SOCKET, SO_RCVBUF, (const char *)&rcvbuf, sizeof(rcvbuf));
+
     raop_rtp->rtp_session_csock = kernel_timestamp_session_create(csock);
     if (raop_rtp->rtp_session_csock == NULL) {
         logger_log(raop_rtp->logger, LOGGER_ERR, "raop_rtp: Failed to allocate high-precision session context (csock)");

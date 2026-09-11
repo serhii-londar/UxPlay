@@ -268,6 +268,17 @@ raop_rtp_mirror_thread(void *arg)
                 logger_log(raop_rtp_mirror->logger, LOGGER_WARNING,
                            "raop_rtp_mirror could not set stream socket keepalive %d %s", sock_err, SOCKET_ERROR_STRING(sock_err));
             }
+
+            /* Set receive buffer to 2MB to prevent TCP window stalls during high-bitrate video bursts */
+            int rcvbuf = 2 * 1024 * 1024;
+            if (setsockopt(stream_fd, SOL_SOCKET, SO_RCVBUF, CAST &rcvbuf, sizeof(rcvbuf)) < 0) {
+                rcvbuf = 1024 * 1024;
+                setsockopt(stream_fd, SOL_SOCKET, SO_RCVBUF, CAST &rcvbuf, sizeof(rcvbuf));
+            }
+
+            /* Disable Nagle's algorithm for low-latency TCP ACKs and streaming */
+            int nodelay = 1;
+            setsockopt(stream_fd, IPPROTO_TCP, TCP_NODELAY, CAST &nodelay, sizeof(nodelay));
             option = 60;
             if (setsockopt(stream_fd, SOL_TCP, TCP_KEEPIDLE, CAST &option, sizeof(option)) < 0) {
                 int sock_err = SOCKET_GET_ERROR();
