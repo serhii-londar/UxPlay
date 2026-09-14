@@ -260,13 +260,17 @@ raop_handler_pairpinstart(raop_conn_t *conn,
     logger_log(raop->logger, LOGGER_INFO, "client sent PAIR-PIN-START request");
     int pin_4 = 0;
     if (raop->pin > 9999) {
+        /* fixed pin configured via "-pin NNNN": shared config, same for every client */
         pin_4 = raop->pin % 10000;
     } else {
+        /* no fixed pin: generate a fresh one for THIS connection only (see
+         * raop_conn_s.pending_pin), so a second client pairing concurrently can't
+         * overwrite the PIN this client's user is about to be shown/type. */
         pin_4 = random_pin();
         if (pin_4 < 0) {
             logger_log(raop->logger, LOGGER_ERR, "Failed to generate random pin");
         } else {
-            raop->pin = (unsigned short) pin_4 % 10000;
+            conn->pending_pin = (unsigned short) pin_4 % 10000;
         }
     }
     char pin[6] = { '\0' };
@@ -330,10 +334,13 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
         method = NULL;
         plist_get_string_val(req_user_node, &user);
         logger_log(raop->logger, LOGGER_INFO, "pair-setup-pin:  device_id = %s", user);
-        snprintf(pin, 6, "%04u", raop->pin % 10000);
-        if (raop->pin < 10000) {
-            raop->pin = 0;
+        if (raop->pin > 9999) {
+            snprintf(pin, 6, "%04u", raop->pin % 10000);
+        } else {
+            snprintf(pin, 6, "%04u", conn->pending_pin);
+            conn->pending_pin = 0;
         }
+        logger_log(raop->logger, LOGGER_DEBUG, "pair-setup-pin: conn=%p building SRP verifier with pin=%s", (void *) conn, pin);
         int ret = srp_new_user(conn->session, raop->pairing, (const char *) user,
                                (const char *) pin, &salt, &len_salt, &pk, &len_pk);
         plist_mem_free(user);

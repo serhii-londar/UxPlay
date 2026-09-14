@@ -128,6 +128,13 @@ struct raop_conn_s {
     char *dacp_id;
     char *active_remote_id;
     char *device_name;
+
+    /* holds the just-displayed onscreen PIN between PAIR-PIN-START and PAIR-SETUP-PIN for
+     * THIS connection only, when raop->pin isn't a fixed configured value (raop->pin <=
+     * 9999): keeping it per-connection instead of on the shared raop_t means two clients
+     * pairing concurrently (multi-client mode) can't overwrite each other's pending PIN.
+     * Safe unsynchronized: both handlers only ever run on the single httpd_thread. */
+    unsigned short pending_pin;
 };
 typedef struct raop_conn_s raop_conn_t;
 
