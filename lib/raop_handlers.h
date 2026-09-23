@@ -515,16 +515,10 @@ raop_handler_pairverify(raop_conn_t *conn,
             logger_log(raop->logger, LOGGER_ERR, "Invalid pair-verify data");
             return;
         }
-        /* We can fall through these errors, the result will just be garbage... */
-        if (pairing_session_handshake(conn->session, data + 4, data + 4 + X25519_KEY_SIZE)) {
-            logger_log(raop->logger, LOGGER_ERR, "Error initializing pair-verify handshake");
-        }
-        if (pairing_session_get_public_key(conn->session, public_key)) {
-            logger_log(raop->logger, LOGGER_ERR, "Error getting ECDH public key");
-        }
-        if (pairing_session_get_signature(conn->session, signature)) {
-            logger_log(raop->logger, LOGGER_ERR, "Error getting ED25519 signature");
-        }
+        /* Reject unregistered PIN clients before handshake so the session is not
+         * left in STATUS_HANDSHAKE. A later pair-verify step-2 on that session
+         * would fail with "Incorrect pair-verify signature" and iOS would not
+         * fall back to pair-pin-setup until the receiver restarts. */
         if (register_check) {
             bool registered_client = false;
             if (raop->callbacks.check_register) {
@@ -540,8 +534,23 @@ raop_handler_pairverify(raop_conn_t *conn,
                 http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
                 return;
             }
-            pairing_session_set_setup_status(conn->session);
         }
+        if (pairing_session_handshake(conn->session, data + 4, data + 4 + X25519_KEY_SIZE)) {
+            logger_log(raop->logger, LOGGER_ERR, "Error initializing pair-verify handshake");
+            http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
+            return;
+        }
+        if (pairing_session_get_public_key(conn->session, public_key)) {
+            logger_log(raop->logger, LOGGER_ERR, "Error getting ECDH public key");
+            return;
+        }
+        if (pairing_session_get_signature(conn->session, signature)) {
+            logger_log(raop->logger, LOGGER_ERR, "Error getting ED25519 signature");
+            return;
+        }
+        /* Do not pairing_session_set_setup_status() here: handshake already set
+         * STATUS_HANDSHAKE, which pairing_session_finish() requires. Overwriting
+         * with STATUS_SETUP makes the next pair-verify step fail signature check. */
         *response_data = calloc(1, sizeof(public_key) + sizeof(signature));
         if (*response_data) {
             http_response_add_header(response, "Content-Type", "application/octet-stream");

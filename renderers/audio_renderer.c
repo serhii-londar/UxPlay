@@ -310,7 +310,10 @@ int audio_renderer_multi_client_start(int slot, uint64_t generation, unsigned ch
         return -1;
     }
     GstCaps *caps = gst_caps_from_string(caps_str);
-    g_object_set(appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
+    /* do-timestamp: loopback TCP to Flutter must not use AirPlay NTP PTS.
+     * Those can sit 2^32 s ahead of pipeline running time and stall appsrc. */
+    g_object_set(appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE,
+                 "format", GST_FORMAT_TIME, "do-timestamp", TRUE, NULL);
     gst_caps_unref(caps);
 
     GstBus *bus = gst_element_get_bus(pipeline);
@@ -388,28 +391,7 @@ void audio_renderer_multi_client_push(int slot, uint64_t generation, unsigned ch
 
     GstBuffer *buffer = gst_buffer_new_allocate(NULL, data_len, NULL);
     g_assert(buffer != NULL);
-    GstClockTime base = gst_element_get_base_time(s->appsrc);
-    GstClockTime pts = (GstClockTime) ntp_time;
-    if (pts >= base) {
-        GST_BUFFER_PTS(buffer) = pts - base;
-    } else {
-        GST_BUFFER_PTS(buffer) = 0;
-    }
-
-    /* Sanity-clamp timestamps mapped with a desynced rtp<->ntp mapping (e.g. audio re-SETUP
-     * before the new stream's first sync packet): a PTS far ahead of the pipeline's running
-     * time would make the (sync=true) sink wait that long, silently blocking every buffer
-     * behind it. Late/past PTS is harmless (rendered immediately) and left alone. */
-    GstClockTime running_time = gst_element_get_current_running_time(s->appsrc);
-    if (GST_CLOCK_TIME_IS_VALID(running_time) &&
-        GST_BUFFER_PTS(buffer) > running_time + 5 * GST_SECOND) {
-        logger_log(logger, LOGGER_INFO,
-                   "multi-client audio slot %d: buffer PTS %8.6f is %8.6f s ahead of pipeline running time, clamping",
-                   slot, ((double) GST_BUFFER_PTS(buffer)) / GST_SECOND,
-                   ((double) (GST_BUFFER_PTS(buffer) - running_time)) / GST_SECOND);
-        GST_BUFFER_PTS(buffer) = running_time;
-    }
-
+    (void) ntp_time; /* arrival-time stamped by appsrc do-timestamp */
     gst_buffer_fill(buffer, 0, data, data_len);
     gst_app_src_push_buffer(GST_APP_SRC(s->appsrc), buffer);
     g_mutex_unlock(&s->lock);

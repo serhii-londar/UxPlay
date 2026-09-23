@@ -803,7 +803,10 @@ int video_renderer_multi_client_start(int slot, uint64_t generation, const char 
         return -1;
     }
     GstCaps *caps = gst_caps_from_string(video_is_h265 ? h265_caps : h264_caps);
-    g_object_set(appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE, "format", GST_FORMAT_TIME, NULL);
+    /* do-timestamp: loopback JPEG to Flutter must not use AirPlay NTP PTS.
+     * Video has no clamp; a 2^32 s PTS stalls appsrc and the mirror window stays empty. */
+    g_object_set(appsrc, "caps", caps, "stream-type", 0, "is-live", TRUE,
+                 "format", GST_FORMAT_TIME, "do-timestamp", TRUE, NULL);
     gst_caps_unref(caps);
 
     GstBus *bus = gst_element_get_bus(pipeline);
@@ -850,13 +853,7 @@ void video_renderer_multi_client_push(int slot, uint64_t generation, unsigned ch
     }
     GstBuffer *buffer = gst_buffer_new_allocate(NULL, data_len, NULL);
     g_assert(buffer != NULL);
-    GstClockTime base = gst_element_get_base_time(s->appsrc);
-    GstClockTime pts = (GstClockTime) ntp_time;
-    if (pts >= base) {
-        GST_BUFFER_PTS(buffer) = pts - base;
-    } else {
-        GST_BUFFER_PTS(buffer) = 0;
-    }
+    (void) ntp_time; /* arrival-time stamped by appsrc do-timestamp */
     gst_buffer_fill(buffer, 0, data, data_len);
     gst_app_src_push_buffer(GST_APP_SRC(s->appsrc), buffer);
     g_mutex_unlock(&s->lock);
