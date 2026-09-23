@@ -3598,17 +3598,16 @@ int main (int argc, char *argv[]) {
 
     /* read in public keys that were previously registered with pair-setup-pin */
     if (pin_pw == 1 && registration_list && strlen(pairing_register.c_str())) {
-        size_t len = 0;
-        std::string  key;
         int clients = 0;
         std::ifstream file(pairing_register);
         if (file.is_open()) {
             std::string line;
             while (std::getline(file, line)) {
-                /*32 bytes pk -> base64 -> strlen(pk64) = 44 chars = line[0:43]; add '\0' at line[44] */ 
-                line[44] = '\0';
-                std::string pk = line.c_str();
-                registered_keys.push_back(key.assign(pk));
+                /* 32-byte pk -> base64 is 44 chars; ignore truncated/blank lines */
+                if (line.size() < 44) {
+                    continue;
+                }
+                registered_keys.push_back(line.substr(0, 44));
                 clients ++;
             }
             if (clients) {
@@ -3618,7 +3617,7 @@ int main (int argc, char *argv[]) {
         }
     }
 
-    if (pin_pw == 1 && keyfile == "0") {
+    if (keyfile == "0") {
         const char * homedir = get_homedir();
         if (homedir) {
             keyfile.erase();
