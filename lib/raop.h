@@ -47,7 +47,7 @@ const char *get_codec_string(hls_video_codec_t codec);
 typedef void (*raop_log_callback_t)(void *cls, int level, const char *msg);
 
 typedef struct playback_info_s {
-  //char * uuid;
+    const char *uuid;  /* the video that plays (its playback uuid), or NULL */
     uint32_t stallcount;
     double duration;
     double position;

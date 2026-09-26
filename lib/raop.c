@@ -88,7 +88,10 @@ struct raop_s {
     /* place to store media_data_store */
     airplay_video_t *airplay_video[MAX_AIRPLAY_VIDEO];
     int current_video;
-  
+    /* the video the client removed (playlistRemove), until POST /stop or /play: the client may insert the one
+       that replaces it (playlistInsert) */
+    int removed_video;
+
     /* activate support for HLS live streaming */
     bool hls_support;
     bool hls_pending;
@@ -728,6 +731,7 @@ raop_init(raop_callbacks_t *callbacks) {
 
     /* initialize airplay_video */
     raop->current_video = -1;
+    raop->removed_video = -1;
     for (int i= 0; i < MAX_AIRPLAY_VIDEO; i++) {
         raop->airplay_video[i] = NULL;
     }
@@ -985,6 +989,9 @@ void raop_destroy_airplay_video(raop_t *raop, int id) {
             raop->airplay_video[i] = NULL;
             if (i == raop->current_video) {
                 raop->current_video = -1;
+            }
+            if (i == raop->removed_video) {
+                raop->removed_video = -1;
             }
         }
     }
