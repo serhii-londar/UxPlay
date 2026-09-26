@@ -588,6 +588,13 @@ raop_handler_fpsetup(raop_conn_t *conn,
 
     data = (unsigned char *) http_request_get_data(request, &datalen);
     if (datalen == 16) {
+        if (data[4] != 0x03) {
+            logger_log(raop->logger, LOGGER_ERR, " Client sent an unsupported type 0x%02x FairPlay challenge:\n"
+            "Only type 0x03 can be handled using publically-available information", data[4]);
+            http_response_init(response, "RTSP/1.0", 501, "Not Implemented");
+            return;
+        }  
+
         *response_data = calloc(142, sizeof(char));
         if (*response_data) {
             http_response_add_header(response, "Content-Type", "application/octet-stream");
@@ -1211,24 +1218,28 @@ raop_handler_set_parameter(raop_conn_t *conn,
     if (!strcmp(content_type, "text/parameters")) {
         char *datastr = NULL;
         datastr = calloc(1, datalen + 1);
-        if (data && datastr && conn->raop_rtp) {
+        if (data && datastr) {
             memcpy(datastr, data, datalen);
             if ((datalen >= 8) && !strncmp(datastr, "volume: ", 8)) {
                 float vol = 0.0f;
                 sscanf(datastr+8, "%f", &vol);
-                if (raop_rtp_is_running(conn->raop_rtp)) {
+                /* A HLS video session has no RAOP audio stream on this connection: the volume then goes to the
+                 * renderers directly, instead of being dropped with the warning below. */
+                if (conn->raop_rtp && raop_rtp_is_running(conn->raop_rtp)) {
                     raop_rtp_set_volume(conn->raop_rtp, vol);
                 } else if (raop->callbacks.audio_set_volume) {
                     /* set volume in playbin (hls) */
                     raop->callbacks.audio_set_volume(raop->callbacks.cls, vol);
                 }
-            } else if ((datalen >= 10) && !strncmp(datastr, "progress: ", 10)) {
-                uint32_t start = 0, curr = 0, end = 0;
-                sscanf(datastr+10, "%"PRIu32"/%"PRIu32"/%"PRIu32, &start, &curr, &end);
-                raop_rtp_set_progress(conn->raop_rtp, start, curr, end);
+            } else if (conn->raop_rtp) {
+                if ((datalen >= 10) && !strncmp(datastr, "progress: ", 10)) {
+                    uint32_t start = 0, curr = 0, end = 0;
+                    sscanf(datastr+10, "%"PRIu32"/%"PRIu32"/%"PRIu32, &start, &curr, &end);
+                    raop_rtp_set_progress(conn->raop_rtp, start, curr, end);
+                }
+            } else {
+                logger_log(raop->logger, LOGGER_WARNING, "RAOP not initialized at SET_PARAMETER");
             }
-        } else if (!conn->raop_rtp) {
-            logger_log(raop->logger, LOGGER_WARNING, "RAOP not initialized at SET_PARAMETER");
         }
         free(datastr);
     } else if (!strcmp(content_type, "image/jpeg") || !strcmp(content_type, "image/png")) {

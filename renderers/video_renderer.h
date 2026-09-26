@@ -89,6 +89,8 @@ void video_renderer_multi_client_push(int slot, uint64_t generation, unsigned ch
 void video_renderer_multi_client_stop(int slot);
 
 void video_renderer_hls_set_volume(double volume);
+void video_renderer_set_window_handle(uintptr_t handle);
+bool gstreamer_decoder_check(const char *decoder);
 #ifdef __cplusplus
 }
 #endif

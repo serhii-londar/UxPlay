@@ -23,9 +23,31 @@
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
 #include "video_renderer.h"
+#include <gst/video/videooverlay.h>
+
+static uintptr_t external_window_handle = 0;
+
+static GstBusSyncReply
+window_handle_bus_sync_handler(GstBus *bus, GstMessage *message, gpointer user_data) {
+    if (gst_is_video_overlay_prepare_window_handle_message(message)) {
+        if (external_window_handle) {
+            GstElement *sink = GST_ELEMENT(GST_MESSAGE_SRC(message));
+            gst_video_overlay_set_window_handle(GST_VIDEO_OVERLAY(sink), (guintptr) external_window_handle);
+        }
+        gst_message_unref(message);
+        return GST_BUS_DROP;
+    }
+    return GST_BUS_PASS;
+}
+
+/* can be called to make a previously-prepared external video window available for GStreamer to use.
+ * If it has not already been called when the "prepare_window_handle" message is received, GStreamer
+ * will create its own window (which is currently the case on all supported platforms) */
+void video_renderer_set_window_handle(uintptr_t handle) {
+    external_window_handle = handle;
+}
 
 #define SECOND_IN_NSECS 1000000000UL
-#define SECOND_IN_MICROSECS 1000000
 #ifdef X_DISPLAY_FIX
 #include <gst/video/navigation.h>
 #include "x_display_fix.h"
@@ -53,6 +75,10 @@ static gboolean hls_seek_enabled = FALSE;
 static gboolean hls_playing = FALSE;
 static gboolean hls_buffer_empty = FALSE;
 static gboolean hls_buffer_full = FALSE;
+/* The gain last asked for, kept outside the playbin: a HLS session builds a new one for every video, and
+ * without this each video would start at GStreamer's default instead of the volume the client believes this
+ * receiver has. */
+static gdouble hls_volume_level = 1.0;
 static int type_264 = 0;
 static int type_265 = 0;
 static int type_hls = 0;
@@ -341,6 +367,7 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             flags |= GST_PLAY_FLAG_DOWNLOAD;
             flags |= GST_PLAY_FLAG_BUFFERING;    // set by default in playbin3, but not in playbin2; is it needed?
             g_object_set(renderer_type[i]->pipeline, "flags", flags, NULL);
+            g_object_set(renderer_type[i]->pipeline, "volume", hls_volume_level, NULL);
             //g_object_set (G_OBJECT (renderer_type[i]->pipeline), "uri", uri, NULL);
         } else {
             bool jpeg_pipeline = false;
@@ -464,7 +491,8 @@ void video_renderer_init(logger_t *render_logger, const char *server_name, video
             }
         }
 #endif
-        renderer_type[i]->bus = gst_element_get_bus(renderer_type[i]->pipeline);	
+        renderer_type[i]->bus = gst_element_get_bus(renderer_type[i]->pipeline);
+        gst_bus_set_sync_handler(renderer_type[i]->bus, window_handle_bus_sync_handler, NULL, NULL);
         gst_element_set_state (renderer_type[i]->pipeline, GST_STATE_READY);
         GstState state;
         GstStateChangeReturn ret = gst_element_get_state (renderer_type[i]->pipeline, &state, NULL, 100 * GST_MSECOND);
@@ -539,11 +567,14 @@ bool waiting_for_x11_window() {
         return false;
     }
 #ifdef X_DISPLAY_FIX
-    if (use_x11 && renderer->gst_window) {
-        get_x_window(renderer->gst_window, renderer->server_name);
-        if (!renderer->gst_window->window) {
-	    return true;    /* window still not found */
-        }
+    /* nothing to find, or to make fullscreen, without an X11 window: a videosink that is not an X11
+       one (e.g. waylandsink), no X11 display, or no renderer */
+    if (!use_x11 || !renderer || !renderer->gst_window) {
+        return false;
+    }
+    get_x_window(renderer->gst_window, renderer->server_name);
+    if (!renderer->gst_window->window) {
+        return true;    /* window still not found */
     }
     if (fullscreen) {
          set_fullscreen(renderer->gst_window, &fullscreen);
@@ -999,8 +1030,11 @@ void video_renderer_destroy() {
     for (int i = 0; i < n_renderers; i++) {
         if (renderer_type[i]) {
             video_renderer_destroy_instance(renderer_type[i]);
+            renderer_type[i] = NULL;
         }
     }
+    /* until video_renderer_init, requests from the client (playback-info, scrub, rate) find no renderer */
+    renderer = NULL;
 }
 
 static void get_stream_status_name(GstStreamStatusType type, char *name, size_t len) {
@@ -1374,18 +1408,22 @@ bool video_get_playback_info(double *duration, double *position, double *seek_st
     return true;
 }
 
+/* a position in seconds as GStreamer time: 32-bit microseconds end at 2147 s (35:47), and a
+ * later position was converted to that (aarch64 saturates) or to a negative time (x86) */
+static gint64 seconds_to_gst_time(float position) {
+    return (gint64) ((double) position * GST_SECOND);
+}
+
 void video_renderer_set_start(float position) {
-    int pos_in_micros = (int) (position * SECOND_IN_MICROSECS);
-    hls_requested_start_position = (gint64) (pos_in_micros * GST_USECOND);
+    hls_requested_start_position = seconds_to_gst_time(position);
     logger_log(logger, LOGGER_DEBUG, "register HLS video start position %f %lld", position,
-               hls_requested_start_position);    
+               hls_requested_start_position);
 }
 
 void video_renderer_seek(float position) {
-    int pos_in_micros = (int) (position * SECOND_IN_MICROSECS);
-    gint64 seek_position = (gint64) (pos_in_micros * GST_USECOND);
+    gint64 seek_position = seconds_to_gst_time(position);
     /* don't seek to within 1  microsecond  of beginning or end of video */
-    if (hls_duration < 2000) return;
+    if (!renderer || hls_duration < 2000) return;
     seek_position =  seek_position < 1000 ? 1000 : seek_position;
     seek_position =  seek_position > hls_duration  - 1000 ? hls_duration - 1000 : seek_position;
     g_print("SCRUB: seek to %f secs =  %" GST_TIME_FORMAT ", duration = %" GST_TIME_FORMAT "\n", position,
@@ -1409,7 +1447,7 @@ unsigned int video_renderer_listen(void *loop, int id) {
 }
 
 bool video_renderer_eos_watch() {
-    if (hls_video && renderer->eos) {
+    if (hls_video && renderer && renderer->eos) {
         renderer->eos = FALSE;
 	return true;
     }
@@ -1417,10 +1455,20 @@ bool video_renderer_eos_watch() {
 }
 
 void video_renderer_hls_set_volume(double volume) {
-    if (!renderer || strcmp(renderer->codec, hls)) {
-       return;
-    }
     volume = (volume > 10.0) ? 10.0 : volume;
     volume = (volume < 0.0) ? 0.0 : volume;
-    g_object_set(renderer->pipeline, "volume", volume, NULL);
+    hls_volume_level = (gdouble) volume;
+    if (!renderer || strcmp(renderer->codec, hls)) {
+       return;    /* no playbin to set: video_renderer_init gives the next one this volume */
+    }
+    g_object_set(renderer->pipeline, "volume", hls_volume_level, NULL);
+}
+
+bool gstreamer_decoder_check(const char *decoder) {
+    GstElementFactory *factory = gst_element_factory_find(decoder) ;
+    if (!factory) {
+        return false;
+    }
+    gst_object_unref(factory);
+    return true;
 }

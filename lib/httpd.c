@@ -151,7 +151,10 @@ httpd_get_connection_by_type (httpd_t *httpd, connection_type_t type, int instan
     return NULL;
 }
 
-#define MAX_CONNECTIONS 12  /* value used in AppleTV 3*/
+/* Raised from AppleTV-3's 12: multi-client mirroring needs one RAOP (and
+ * briefly other) connection per device, plus discovery probes. 64 matches
+ * the Flect/HeutaLab multi-client fork headroom. */
+#define MAX_CONNECTIONS 64
 httpd_t *
 httpd_init(logger_t *logger, httpd_callbacks_t *callbacks, int nohold)
 {
