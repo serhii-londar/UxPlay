@@ -278,9 +278,37 @@ conn_request(void *ptr, http_request_t *request, http_response_t **response) {
         ble = true;
     }
 
- /* this rejects messages from _airplay._tcp for video streaming protocol unless bool raop->hls_support is true*/   
+ /* AirPlay video (_airplay._tcp, no CSeq) is a different session from screen
+     * mirroring. YouTube treats a receiver that accepts it, or that never
+     * answers, as an external display: the iPhone screen goes black and a
+     * second, larger canvas is rendered for the Mac. Without -hls, answer
+     * /server-info as mirror-only and reject the rest so the app keeps
+     * drawing on the phone. Do not leave the request unanswered. */
     if (!cseq && !raop->hls_support && !ble) {
-        logger_log(raop->logger, LOGGER_INFO, "ignoring AirPlay video streaming request (use option -hls to activate HLS support)");
+        const bool server_info = method && url && !strcmp(method, "GET") && !strcmp(url, "/server-info");
+        if (server_info) {
+            logger_log(raop->logger, LOGGER_INFO,
+                       "AirPlay video /server-info while HLS is off: advertising mirror-only features");
+        } else {
+            logger_log(raop->logger, LOGGER_INFO,
+                       "rejecting AirPlay video request %s %s (HLS support is off)",
+                       method ? method : "", url ? url : "");
+        }
+        *response = http_response_create();
+        http_response_init(*response, protocol, server_info ? 200 : 501,
+                           server_info ? "OK" : "Not Implemented");
+        char *video_response_data = NULL;
+        int video_response_datalen = 0;
+        if (server_info) {
+            http_handler_server_info(conn, request, *response, &video_response_data, &video_response_datalen);
+        } else {
+            http_response_set_disconnect(*response, 1);
+        }
+        http_response_add_header(*response, "Server", "AirTunes/" GLOBAL_VERSION);
+        http_response_finish(*response, video_response_data, video_response_datalen);
+        if (video_response_data) {
+            free(video_response_data);
+        }
         return;
     }
 
