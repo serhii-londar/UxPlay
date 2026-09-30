@@ -2461,10 +2461,6 @@ static int start_dnssd(std::vector<char> hw_addr, std::string name) {
 
     /* needed for HLS video support */
     dnssd_set_airplay_features(dnssd, 0, (int) hls_support);
-    /* FairPlay-video (bit 2) is the AirPlay video DRM flag, not screen mirroring.
-     * Leaving it on makes YouTube externalize playback: iPhone goes black, Mac
-     * shows a separate large canvas. Advertise it only with -hls. */
-    dnssd_set_airplay_features(dnssd, 2, (int) hls_support);
     dnssd_set_airplay_features(dnssd, 4, (int) hls_support);
     // not sure about this one (bit 8, screen rotation supported):
     //dnssd_set_airplay_features(dnssd, 8, (int) hls_support);

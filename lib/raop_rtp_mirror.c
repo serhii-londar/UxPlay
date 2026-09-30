@@ -620,8 +620,9 @@ raop_rtp_mirror_thread(void *arg)
                 if (raop_rtp_mirror->callbacks.video_report_size) {
                     raop_rtp_mirror->callbacks.video_report_size(raop_rtp_mirror->callbacks.cls, raop_rtp_mirror->ntp, &width_source, &height_source, &width, &height);
                 }
-                logger_log(raop_rtp_mirror->logger, LOGGER_DEBUG, "raop_rtp_mirror width_source = %f height_source = %f width = %f height = %f",
-                           width_source, height_source, width, height);
+                logger_log(raop_rtp_mirror->logger, LOGGER_INFO,
+                           "mirror video size %.0fx%.0f (source %.0fx%.0f)",
+                           width, height, width_source, height_source);
 
                 if (payload_size == 0) {
                     logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "raop_rtp_mirror: received type 0x01 packet with no payload:\n"

@@ -175,15 +175,8 @@ http_handler_server_info(raop_conn_t *conn, http_request_t *request, http_respon
      * 5. slideshow supported
      * 6. (unknown)
      * 9. audio supported.
-     *
-     * Bits 0, 2 and 4 tell YouTube this is a video target. It then blanks the
-     * iPhone and renders a separate large screen. Clear them unless HLS is on.
      */
-    uint64_t features = 0x27Fu;
-    if (!raop->hls_support) {
-        features &= ~((uint64_t) 0x15u);
-    }
-    plist_t features_node = plist_new_uint(features); 
+    plist_t features_node = plist_new_uint(0x27F); 
     plist_dict_set_item(r_node, "features", features_node);
 
     plist_t mac_address_node = plist_new_string(hw_addr);

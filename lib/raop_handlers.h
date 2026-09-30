@@ -32,6 +32,30 @@
 typedef void (*raop_handler_t)(raop_conn_t *, http_request_t *,
                                http_response_t *, char **, int *);
 
+static void
+iphone_point_size(const char *model, unsigned int *width, unsigned int *height)
+{
+    static const struct { const char *model; unsigned int w, h; } sizes[] = {
+        {"iPhone14,4", 375, 812}, {"iPhone14,5", 390, 844}, {"iPhone14,2", 390, 844},
+        {"iPhone14,3", 428, 926}, {"iPhone14,6", 375, 667}, {"iPhone14,7", 390, 844},
+        {"iPhone14,8", 428, 926}, {"iPhone15,2", 393, 852}, {"iPhone15,3", 430, 932},
+        {"iPhone15,4", 393, 852}, {"iPhone15,5", 430, 932}, {"iPhone16,1", 393, 852},
+        {"iPhone16,2", 430, 932}, {"iPhone17,1", 402, 874}, {"iPhone17,2", 440, 956},
+        {"iPhone17,3", 393, 852}, {"iPhone17,4", 430, 932}, {"iPhone17,5", 390, 844},
+        {"iPhone18,1", 402, 874}, {"iPhone18,2", 440, 956}, {"iPhone18,3", 402, 874},
+        {"iPhone18,4", 420, 912},
+    };
+    *width = 393;
+    *height = 852;
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); i++) {
+        if (strcmp(model, sizes[i].model) == 0) {
+            *width = sizes[i].w;
+            *height = sizes[i].h;
+            return;
+        }
+    }
+}
+
 
 static void
 raop_handler_info(raop_conn_t *conn,
@@ -216,17 +240,27 @@ raop_handler_info(raop_conn_t *conn,
     plist_array_append_item(audio_formats_node, audio_format_1_node);
     plist_dict_set_item(res_node, "audioFormats", audio_formats_node);
 
+    /* iOS refuses to mirror without a displays entry. A landscape 16:9 entry makes
+     * apps such as YouTube lay out for a TV, so an iPhone gets its own portrait
+     * point size. Pixels equal points so the stream is not rescaled. */
+    unsigned int display_width = raop->width;
+    unsigned int display_height = raop->height;
+    if (conn->client_model && strncmp(conn->client_model, "iPhone", 6) == 0) {
+        iphone_point_size(conn->client_model, &display_width, &display_height);
+        logger_log(raop->logger, LOGGER_INFO, "mirror display for %s: %ux%u",
+                   conn->client_model, display_width, display_height);
+    }
     plist_t displays_node = plist_new_array();
     plist_t displays_0_node = plist_new_dict();
     plist_t displays_0_width_physical_node = plist_new_uint(0);
     plist_t displays_0_height_physical_node = plist_new_uint(0);
     plist_t displays_0_uuid_node = plist_new_string("e0ff8a27-6738-3d56-8a16-cc53aacee925");
-    plist_t displays_0_width_node = plist_new_uint(raop->width);
-    plist_t displays_0_height_node = plist_new_uint(raop->height);
-    plist_t displays_0_width_pixels_node = plist_new_uint(raop->width);
-    plist_t displays_0_height_pixels_node = plist_new_uint(raop->height);
-    plist_t displays_0_rotation_node = plist_new_bool(0); /* set to true in AppleTV gen 3 (which has features bit 8  set */
-    plist_t displays_0_refresh_rate_node = plist_new_real((double) 1.0 / raop->refreshRate);  /* set as real 0.166666  = 60hz in AppleTV gen 3 */
+    plist_t displays_0_width_node = plist_new_uint(display_width);
+    plist_t displays_0_height_node = plist_new_uint(display_height);
+    plist_t displays_0_width_pixels_node = plist_new_uint(display_width);
+    plist_t displays_0_height_pixels_node = plist_new_uint(display_height);
+    plist_t displays_0_rotation_node = plist_new_bool(0);
+    plist_t displays_0_refresh_rate_node = plist_new_real((double) 1.0 / raop->refreshRate);
     plist_t displays_0_max_fps_node = plist_new_uint(raop->maxFPS);
     plist_t displays_0_overscanned_node = plist_new_bool(raop->overscanned);
     plist_t displays_0_features = plist_new_uint(14);
@@ -238,7 +272,7 @@ raop_handler_info(raop_conn_t *conn,
     plist_dict_set_item(displays_0_node, "height", displays_0_height_node);
     plist_dict_set_item(displays_0_node, "widthPixels", displays_0_width_pixels_node);
     plist_dict_set_item(displays_0_node, "heightPixels", displays_0_height_pixels_node);
-    plist_dict_set_item(displays_0_node, "rotation", displays_0_rotation_node);    
+    plist_dict_set_item(displays_0_node, "rotation", displays_0_rotation_node);
     plist_dict_set_item(displays_0_node, "refreshRate", displays_0_refresh_rate_node);
     plist_dict_set_item(displays_0_node, "maxFPS", displays_0_max_fps_node);
     plist_dict_set_item(displays_0_node, "overscanned", displays_0_overscanned_node);
@@ -789,6 +823,10 @@ raop_handler_setup(raop_conn_t *conn,
         bool admit_client = true;
         plist_t req_model_node = plist_dict_get_item(req_root_node, "model");
         plist_get_string_val(req_model_node, &model);  
+        if (model && model[0]) {
+            free(conn->client_model);
+            conn->client_model = strdup(model);
+        }
         if (!model) {
             plist_t req_model_name_node = plist_dict_get_item(req_root_node, "modelName");
             plist_get_string_val(req_model_name_node, &model);
