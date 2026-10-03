@@ -278,7 +278,9 @@ int audio_renderer_multi_client_start(int slot, uint64_t generation, unsigned ch
     }
     g_free(port_str);
 
-    GString *launch = g_string_new("appsrc name=audio_source ! queue ! ");
+    /* 20ms cap. The default queue holds a full second, then dumps it. The
+     * player ring jumps its read head on that burst and the jump scrapes. */
+    GString *launch = g_string_new("appsrc name=audio_source ! queue max-size-buffers=0 max-size-bytes=0 max-size-time=20000000 ! ");
     g_string_append(launch, decoder);
     if (g_strstr_len(rtp_pipeline_template, -1, "%PORT%") != NULL) {
         g_string_append(launch, "audioconvert ! audioresample ! audio/x-raw,format=S16BE,rate=44100,channels=2 ! rtpL16pay ");
@@ -464,7 +466,7 @@ void audio_renderer_init(logger_t *render_logger, const char* audiosink, const b
         renderer_type[i] = (audio_renderer_t *)  calloc(1,sizeof(audio_renderer_t));
         g_assert(renderer_type[i]);
         GString *launch = g_string_new("appsrc name=audio_source ! ");
-        g_string_append(launch, "queue ! ");
+        g_string_append(launch, "queue max-size-buffers=0 max-size-bytes=0 max-size-time=20000000 ! ");
         switch (i) {
         case 0:    /* AAC-ELD */
         case 2:    /* AAC-LC */
