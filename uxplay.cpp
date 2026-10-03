@@ -174,6 +174,8 @@ static unsigned char pin_pw = 0;  /* 0: no client access control; 1: onscreen pi
 static std::string password = "";
 static guint min_password_length = MIN_PASSWORD_LENGTH;
 static unsigned short pin = 0;
+static bool pin_from_stdin = false;
+static bool password_from_stdin = false;
 static std::string keyfile = "";
 static std::string mac_address = "";
 static std::string dacpfile = "";
@@ -1956,6 +1958,11 @@ static void parse_arguments (int argc, char *argv[]) {
                 }
                 pin = n + 10000;
             }
+        } else if (arg == "-pin-stdin") {
+            /* PIN arrives as the first stdin line so it is not visible in ps. */
+            setup_legacy_pairing = true;
+            pin_pw = 1;
+            pin_from_stdin = true;
         } else if (arg == "-p2p") {
 #if defined(__APPLE__) && defined(UXPLAY_HAVE_APPLE_P2P)
             LOGI("macOS  point-to-point Airplay settings are in System Settings->General->AirDrop & Continuity->AirPlay->AirPlayReceiver"); 
@@ -2019,6 +2026,11 @@ static void parse_arguments (int argc, char *argv[]) {
             } else {
                 pin_pw = 3;  //a random password (pin) will be displayed at each connection
             }
+        } else if (arg == "-pw-stdin") {
+            /* Password arrives as the first stdin line so it is not visible in ps. */
+            setup_legacy_pairing = false;
+            pin_pw = 2;
+            password_from_stdin = true;
         } else if (arg == "-dacp") {
             dacpfile.erase();
             if (i < argc - 1 && *argv[i+1] != '-') {
@@ -2612,6 +2624,35 @@ static void multi_client_disconnect_slot(int slot) {
 // CLIENT_DISCONNECTED already flow the other direction over stdout. Only started in
 // multi-client mode (see main()); left running detached since the process exiting is the
 // only way this thread ever needs to end.
+/* Consume the pairing secret before the DISCONNECT command thread starts. */
+static int read_pairing_secret_from_stdin() {
+    if (!pin_from_stdin && !password_from_stdin) return 0;
+    std::string line;
+    if (!std::getline(std::cin, line)) {
+        fprintf(stderr, "failed to read pairing secret from stdin\n");
+        return -1;
+    }
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    if (pin_from_stdin) {
+        unsigned int n = 9999;
+        if (!get_value(line.c_str(), &n)) {
+            fprintf(stderr, "invalid pin from stdin; expected 4 digits in [0001,9999]\n");
+            return -1;
+        }
+        pin = (unsigned short) (n + 10000);
+        return 0;
+    }
+    password = line;
+    pin_pw = 2;
+    if (password.size() < min_password_length) {
+        fprintf(stderr, "invalid client-access password from stdin: length must be at least %u characters\n",
+                min_password_length);
+        password.clear();
+        return -1;
+    }
+    return 0;
+}
+
 static void stdin_command_thread_func() {
     std::string line;
     while (std::getline(std::cin, line)) {
@@ -3454,6 +3495,10 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.on_video_playlist_remove = on_video_playlist_remove;
     raop_cbs.on_video_acquire_playback_info = on_video_acquire_playback_info;
     raop_cbs.get_custom_profile = get_custom_profile;
+
+    if (read_pairing_secret_from_stdin() != 0) {
+        return -1;
+    }
 
     raop = raop_init(&raop_cbs);
     if (raop == NULL) {
