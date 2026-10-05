@@ -560,22 +560,26 @@ void video_renderer_start() {
 #endif
 }
 
-/* used to find any X11 Window used by the playbin (HLS) pipeline after it starts playing. 
-*  if use_x11 is true, called every 100 ms after playbin state is READY until the x11 window is found*/
+/* this is a g_timeout_add (100ms interval) callback in the uxplay main_loop that watches to see if an X11 window has been
+   created by GStreamer's Playbin/Playbin3 (to activate X11 features such as full-screen toggle.).
+   Initially renderer->use_x11 is true if the requested videosink was either X11 (xvimagesink or ximagesink)
+   or auto (autovideosink, fpsdisplaysink).    In the auto case, renderer->use_x11 is set to false
+   once a bus message that the  videosink has been chosen is received, and the choice is NOT X11. */
 bool waiting_for_x11_window() {
     if (!hls_video) {
+        /* not HLS */
         return false;
     }
 #ifdef X_DISPLAY_FIX
-    /* nothing to find, or to make fullscreen, without an X11 window: a videosink that is not an X11
-       one (e.g. waylandsink), no X11 display, or no renderer */
-    if (!use_x11 || !renderer || !renderer->gst_window) {
+    /*not using X11 */
+    if (!renderer || !renderer->gst_window || !renderer->use_x11) {
         return false;
     }
     get_x_window(renderer->gst_window, renderer->server_name);
     if (!renderer->gst_window->window) {
-        return true;    /* window still not found */
+        return true;    /* may be using X11, but window still not found */
     }
+    /* have found X11 window */
     if (fullscreen) {
          set_fullscreen(renderer->gst_window, &fullscreen);
     }
@@ -1071,7 +1075,8 @@ static void hls_video_seek_to_start_position(GstElement *pipeline) {
         && hls_requested_start_position  <= hls_seek_end) {
         g_print("***************** seek to hls_requested_start_position %" GST_TIME_FORMAT "\n", GST_TIME_ARGS(hls_requested_start_position));
         if (gst_element_seek_simple (pipeline, GST_FORMAT_TIME,
-				 GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT, hls_requested_start_position)) {
+                                     (GstSeekFlags) (GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE),
+                                     hls_requested_start_position)) {
             hls_requested_start_position = 0;
         } else {
             g_print("*** seek to requested_start_position failed\n"); 
@@ -1351,7 +1356,7 @@ int video_renderer_choose_codec (bool video_is_jpeg, bool video_is_h265) {
         if (renderer_type[i] == renderer) {
             continue;
         }
-	if (renderer_type[i]) {
+        if (renderer_type[i]) {
             video_renderer_t *renderer_unused = renderer_type[i];
             renderer_type[i] = NULL;
             video_renderer_destroy_instance(renderer_unused);
@@ -1429,7 +1434,7 @@ void video_renderer_seek(float position) {
     g_print("SCRUB: seek to %f secs =  %" GST_TIME_FORMAT ", duration = %" GST_TIME_FORMAT "\n", position,
             GST_TIME_ARGS(seek_position),  GST_TIME_ARGS(hls_duration));
     gboolean result = gst_element_seek_simple(renderer->pipeline, GST_FORMAT_TIME,
-                                              (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_KEY_UNIT),
+                                              (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE),
                                               seek_position);
     if (result) {
         g_print("seek succeeded\n");
