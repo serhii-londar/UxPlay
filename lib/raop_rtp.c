@@ -36,6 +36,9 @@
 #define NO_FLUSH (-42)
 
 #define SECOND_IN_NSECS 1000000000
+
+#define SM_DIAG_FILE "uxplay_audio.csv"
+#include "sm_diag.h"
 #define SEC SECOND_IN_NSECS
 
 #define DELAY_AAC  0.20 //empirical, matches audio latency of about -0.25 sec after first clock sync event
@@ -213,6 +216,10 @@ raop_rtp_resend_callback(void *opaque, unsigned short seqnum, unsigned short cou
     addrlen = raop_rtp->control_saddr_len;
 
     logger_log(raop_rtp->logger, LOGGER_DEBUG, "raop_rtp got resend request %d %d", seqnum, count);
+    {
+        FILE *diag = sm_diag();
+        if (diag) fprintf(diag, "resend,%.1f,%u,%u,\n", sm_diag_epoch_ms(), (unsigned) seqnum, (unsigned) count);
+    }
     ourseqnum = raop_rtp->control_seqnum++;
 
     /* Fill the request buffer */
@@ -626,6 +633,20 @@ raop_rtp_thread_udp(void *arg)
                 continue;
             }
 
+            {
+                /* diagnostics: gap between consecutive UDP audio packets */
+                static __thread double sm_last_arrival = 0;
+                FILE *diag = sm_diag();
+                if (diag) {
+                    double now = sm_diag_mono_ms();
+                    if (sm_last_arrival > 0 && now - sm_last_arrival > 30.0) {
+                        fprintf(diag, "arrival_gap,%.1f,%.1f,%u,\n", sm_diag_epoch_ms(), now - sm_last_arrival,
+                                (unsigned) byteutils_get_short_be(packet, 2));
+                    }
+                    sm_last_arrival = now;
+                }
+            }
+
             if (!raop_rtp->initial_sync &&  raop_rtp->ct == 8 && video_arrival_offset) {
                 /* estimate a fake initial remote timestamp for video  synchronization  with AAC audio before the first rtp sync */
                  uint64_t ts = raop_ntp_get_local_time() - video_arrival_offset;
@@ -662,7 +683,18 @@ raop_rtp_thread_udp(void *arg)
                 unsigned short seqnum = 0;
                 uint32_t rtp_timestamp = 0;
 
+                static __thread double sm_last_push = 0;
+                int sm_pushed = 0;
                 while ((payload = raop_buffer_dequeue(raop_rtp->buffer, &payload_size, &rtp_timestamp, &seqnum, no_resend))) {
+                    FILE *sm_file = sm_diag();
+                    if (sm_file) {
+                        double sm_now = sm_diag_mono_ms();
+                        if (sm_last_push > 0 && sm_now - sm_last_push > 30.0) {
+                            fprintf(sm_file, "push_gap,%.1f,%.1f,%u,\n", sm_diag_epoch_ms(), sm_now - sm_last_push, (unsigned) seqnum);
+                        }
+                        sm_last_push = sm_now;
+                        sm_pushed++;
+                    }
                     audio_decode_struct audio_data; 
                     audio_data.rtp_time = rtp_timestamp;
                     audio_data.seqnum = seqnum;
@@ -683,6 +715,10 @@ raop_rtp_thread_udp(void *arg)
 
                     raop_rtp->callbacks.audio_process(raop_rtp->callbacks.cls, raop_rtp->ntp, &audio_data);
                     free(payload);
+                }
+                if (sm_pushed >= 4) {
+                    FILE *sm_file = sm_diag();
+                    if (sm_file) fprintf(sm_file, "burst,%.1f,%d,,\n", sm_diag_epoch_ms(), sm_pushed);
                 }
 
                 /* Handle possible resend requests */

@@ -49,6 +49,9 @@
 #define SECOND_IN_NSECS 1000000000UL
 #define SEC SECOND_IN_NSECS
 
+#define SM_DIAG_FILE "uxplay_video.csv"
+#include "sm_diag.h"
+
 /* for MacOS, where SOL_TCP and TCP_KEEPIDLE are not defined */
 #if !defined(SOL_TCP) && defined(IPPROTO_TCP)
 #define SOL_TCP IPPROTO_TCP
@@ -395,6 +398,14 @@ raop_rtp_mirror_thread(void *arg)
                 logger_log(raop_rtp_mirror->logger, LOGGER_ERR, "raop_rtp_mirror error in recv: %d %s", sock_err, SOCKET_ERROR_STRING(sock_err));
                 if (errno == SOCKET_ERRORNAME(ECONNRESET)) conn_reset = true;
                 break;
+            }
+
+            if (packet[4] == 0x00) {
+                /* diagnostics: keyframes and large frames (a burst of traffic and decode work) */
+                FILE *diag = sm_diag();
+                if (diag && (packet[5] == 0x10 || payload_size > 40000)) {
+                    fprintf(diag, "%s,%.1f,%d,,\n", packet[5] == 0x10 ? "idr" : "big", sm_diag_epoch_ms(), payload_size);
+                }
             }
 
             switch (packet[4]) {
