@@ -669,6 +669,16 @@ conn_destroy(void *ptr) {
 
     free(conn->local);
     free(conn->remote);
+    if (raop->callbacks.unregister_client && conn->session) {
+        /* pk is only available when this connection did pair-setup-pin */
+        char *client_device_id = NULL;
+        char *client_pk = NULL;
+        get_pairing_session_client_data(conn->session, &client_device_id, &client_pk);
+        if (client_pk) {
+            raop->callbacks.unregister_client(raop->callbacks.cls, client_pk);
+            free(client_pk);
+        }
+    }
     pairing_session_destroy(conn->session);
     fairplay_destroy(conn->fairplay);
     if (conn->client_session_id) {

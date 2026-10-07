@@ -180,6 +180,9 @@ static std::string keyfile = "";
 static std::string mac_address = "";
 static std::string dacpfile = "";
 static bool registration_list = false;
+/* -pin-each: a client's pin registration lasts only as long as its connection, so
+ * the (fixed) pin is asked for at every new connection and is never persisted. */
+static bool pin_each = false;
 static std::string pairing_register = "";
 static std::vector <std::string> registered_keys;
 static double db_low = -30.0;
@@ -1063,6 +1066,8 @@ static void print_info (char *name) {
     printf("          default pin is random: optionally use fixed pin xxxx\n");
     printf("-p2p      Advertise and accept AirPlay over Apple peer-to-peer (macOS only)\n");
     printf("          uses a one-time pin; makes UxPlay visible to nearby Apple devices\n");
+    printf("-pin-each Ask for the pin at every new connection (with -pin; clients are\n");
+    printf("          only remembered while connected, nothing is written to disk)\n");
     printf("-reg [fn] Keep a register in $HOME/.uxplay.register to verify returning\n");
     printf("          client pin-registration; (option: use file \"fn\" for this)\n");
     printf("-pw [pwd] Require use of password to control client access;\n");
@@ -2054,7 +2059,9 @@ static void parse_arguments (int argc, char *argv[]) {
             exit(1);
 #endif
 	    
-	} else if (arg == "-reg") {
+	} else if (arg == "-pin-each") {
+            pin_each = true;
+        } else if (arg == "-reg") {
             registration_list = true;
             pairing_register.erase();
             if (i < argc - 1 && *argv[i+1] != '-') {
@@ -3398,6 +3405,12 @@ extern "C" void register_client(void *cls, const char *device_id, const char *cl
     }
     LOGI("registered new client: %s DeviceID = %s PK = %s", client_name ? client_name : "", device_id ? device_id : "", client_pk);
     std::string pk = client_pk;
+    if (pin_each) {
+        /* One entry per authenticated connection (see unregister_client): a device
+         * that reconnects before its old connection is torn down keeps a valid entry. */
+        registered_keys.push_back(pk);
+        return;
+    }
     if (std::find(registered_keys.begin(), registered_keys.end(), pk) == registered_keys.end()) {
         registered_keys.push_back(pk);
     }
@@ -3407,6 +3420,19 @@ extern "C" void register_client(void *cls, const char *device_id, const char *cl
             fprintf(fp, "%s,%s,%s\n", client_pk, device_id ? device_id : "", client_name ? client_name : "");
             fclose(fp);
         }
+    }
+}
+
+extern "C" void unregister_client(void *cls, const char *client_pk) {
+    if (!pin_each || !client_pk) {
+        return;
+    }
+    /* Drop one entry: the one this connection added when it authenticated. */
+    std::string pk = client_pk;
+    auto it = std::find(registered_keys.begin(), registered_keys.end(), pk);
+    if (it != registered_keys.end()) {
+        registered_keys.erase(it);
+        LOGI("client's pin registration ended with its connection (PIN required next time): PK=%s", client_pk);
     }
 }
 
@@ -3551,6 +3577,7 @@ static int start_raop_server (unsigned short display[5], unsigned short tcp[3], 
     raop_cbs.display_pin = display_pin;
     raop_cbs.register_client = register_client;
     raop_cbs.check_register = check_register;
+    raop_cbs.unregister_client = unregister_client;
     raop_cbs.passwd = passwd;
     raop_cbs.export_dacp = export_dacp;
     raop_cbs.video_reset = video_reset;
@@ -3975,7 +4002,7 @@ int main (int argc, char *argv[]) {
     }
 
     /* read in public keys that were previously registered with pair-setup-pin */
-    if (pin_pw == 1 && registration_list && strlen(pairing_register.c_str())) {
+    if (pin_pw == 1 && registration_list && !pin_each && strlen(pairing_register.c_str())) {
         int clients = 0;
         std::ifstream file(pairing_register);
         if (file.is_open()) {

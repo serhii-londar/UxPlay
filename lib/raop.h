@@ -128,6 +128,9 @@ struct raop_callbacks_s {
     void  (*display_pin) (void *cls, char * pin);
     void  (*register_client) (void *cls, const char *device_id, const char *pk_str, const char *name);
     bool  (*check_register) (void *cls, const char *pk_str);
+    /* called when a connection that completed pair-setup-pin is destroyed, so a
+     * session-scoped registration (option -pin-each) can end with the connection */
+    void  (*unregister_client) (void *cls, const char *pk_str);
     const char*  (*passwd) (void *cls, int *len);
     void  (*export_dacp) (void *cls, const char *active_remote, const char *dacp_id);
     int   (*video_set_codec)(void *cls, raop_ntp_t *ntp, video_codec_t codec);
