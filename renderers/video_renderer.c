@@ -899,10 +899,9 @@ void video_renderer_multi_client_push(int slot, uint64_t generation, unsigned ch
         return;
     }
     /* bounded latency: shed compressed frames up to the next keyframe when the backlog passes the cap */
-    bool is_keyframe = video_overflow_has_keyframe(data, (size_t) data_len, s->is_h265);
     bool was_dropping = s->dropping_to_keyframe;
-    if (video_overflow_should_drop(&s->dropping_to_keyframe, gst_app_src_get_current_level_bytes(GST_APP_SRC(s->appsrc)),
-                                   VIDEO_APPSRC_MAX_BYTES, is_keyframe)) {
+    if (video_overflow_filter(&s->dropping_to_keyframe, gst_app_src_get_current_level_bytes(GST_APP_SRC(s->appsrc)),
+                              VIDEO_APPSRC_MAX_BYTES, data, (size_t) data_len, s->is_h265)) {
         if (!was_dropping) {
             logger_log(logger, LOGGER_INFO, "multi-client video slot %d: backlog over cap, dropping to next keyframe", slot);
         }

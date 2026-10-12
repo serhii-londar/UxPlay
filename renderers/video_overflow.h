@@ -48,6 +48,21 @@ static inline bool video_overflow_has_keyframe(const unsigned char *data, size_t
     return false;
 }
 
+static inline bool video_overflow_should_drop(bool *dropping, uint64_t level_bytes, uint64_t max_bytes,
+                                              bool is_keyframe);
+
+/* Single entry point for the push path. Scans for a keyframe only when it can
+ * change the outcome (already dropping, or backlog over the cap), so the common
+ * under-cap frame costs no byte scan. Returns true when the frame is discarded.
+ * [data] is Annex-B: the engine rewrites AirPlay's 4-byte NAL length prefixes to
+ * 00 00 00 01 start codes before frames reach the renderer (raop_rtp_mirror.c). */
+static inline bool video_overflow_filter(bool *dropping, uint64_t level_bytes, uint64_t max_bytes,
+                                         const unsigned char *data, size_t len, bool h265) {
+    bool scan = *dropping || level_bytes > max_bytes;
+    bool is_keyframe = scan && video_overflow_has_keyframe(data, len, h265);
+    return video_overflow_should_drop(dropping, level_bytes, max_bytes, is_keyframe);
+}
+
 /* Decides whether to discard the incoming frame. [dropping] is per-stream state.
  * Keyframes are never discarded: they end a drop run and are always worth decoding. */
 static inline bool video_overflow_should_drop(bool *dropping, uint64_t level_bytes, uint64_t max_bytes,

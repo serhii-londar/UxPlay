@@ -29,6 +29,31 @@ int main(void) {
     /* a keyframe over the cap is still kept and never starts a drop run */
     assert(!video_overflow_should_drop(&dropping, 5000, 1000, true));
     assert(!dropping);
+    /* AirPlay AVCC (4-byte big-endian length) -> Annex-B, exactly as the engine's
+     * raop_rtp_mirror.c loop does before frames reach the renderer. */
+    unsigned char avcc[] = {0, 0, 0, 3, 0x67, 1, 2,  0, 0, 0, 4, 0x65, 9, 9, 9};
+    static const unsigned char start_code[4] = {0, 0, 0, 1};
+    int off = 0;
+    while (off < (int) sizeof avcc) {
+        int len = (avcc[off] << 24) | (avcc[off + 1] << 16) | (avcc[off + 2] << 8) | avcc[off + 3];
+        for (int i = 0; i < 4; i++) avcc[off + i] = start_code[i];
+        off += 4 + len;
+    }
+    assert(video_overflow_has_keyframe(avcc, sizeof avcc, false));
+    /* P frame converted the same way is not a keyframe */
+    unsigned char avcc_p[] = {0, 0, 0, 4, 0x41, 9, 9, 9};
+    for (int i = 0; i < 4; i++) avcc_p[i] = start_code[i];
+    assert(!video_overflow_has_keyframe(avcc_p, sizeof avcc_p, false));
+
+    /* the filter scans lazily: under the cap and not dropping, an IDR-looking
+     * buffer is passed untouched and the state stays clean */
+    dropping = false;
+    assert(!video_overflow_filter(&dropping, 10, 1000, h264_p, sizeof h264_p, false));
+    assert(!dropping);
+    assert(video_overflow_filter(&dropping, 5000, 1000, h264_p, sizeof h264_p, false));
+    assert(video_overflow_filter(&dropping, 10, 1000, h264_p, sizeof h264_p, false));
+    assert(!video_overflow_filter(&dropping, 10, 1000, h264_idr, sizeof h264_idr, false));
+    assert(!dropping);
     puts("video_overflow: ok");
     return 0;
 }
