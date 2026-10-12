@@ -22,6 +22,7 @@
 
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
+#include "video_overflow.h"
 #include "video_renderer.h"
 #include <gst/video/videooverlay.h>
 
@@ -711,6 +712,9 @@ typedef struct {
     guint bus_watch_id;
     uint64_t generation;
     uint64_t expected_generation;
+    bool is_h265;
+    bool dropping_to_keyframe;
+    guint dropped_frames;
     GMutex lock;
 } multi_client_video_slot_t;
 
@@ -812,7 +816,7 @@ int video_renderer_multi_client_start(int slot, uint64_t generation, const char 
     }
     g_free(port_str);
 
-    GString *launch = g_string_new("appsrc name=video_source ! queue ! ");
+    GString *launch = g_string_new("appsrc name=video_source ! queue max-size-buffers=" G_STRINGIFY(VIDEO_QUEUE_MAX_BUFFERS) " max-size-bytes=0 max-size-time=0 ! ");
     g_string_append(launch, parser);
     g_string_append(launch, video_is_h265 ? " ! rtph265pay " : " ! rtph264pay ");
     g_string_append(launch, pipeline_str->str);
@@ -867,6 +871,9 @@ int video_renderer_multi_client_start(int slot, uint64_t generation, const char 
     }
     s->pipeline = pipeline;
     s->appsrc = appsrc;
+    s->is_h265 = video_is_h265;
+    s->dropping_to_keyframe = false;
+    s->dropped_frames = 0;
     s->bus_watch_id = bus_watch_id;
     s->generation = generation;
     s->active = true;
@@ -890,6 +897,23 @@ void video_renderer_multi_client_push(int slot, uint64_t generation, unsigned ch
         g_mutex_unlock(&s->lock);
         logger_log(logger, LOGGER_ERR, "*** ERROR decryption of video packet failed (slot %d)", slot);
         return;
+    }
+    /* bounded latency: shed compressed frames up to the next keyframe when the backlog passes the cap */
+    bool is_keyframe = video_overflow_has_keyframe(data, (size_t) data_len, s->is_h265);
+    bool was_dropping = s->dropping_to_keyframe;
+    if (video_overflow_should_drop(&s->dropping_to_keyframe, gst_app_src_get_current_level_bytes(GST_APP_SRC(s->appsrc)),
+                                   VIDEO_APPSRC_MAX_BYTES, is_keyframe)) {
+        if (!was_dropping) {
+            logger_log(logger, LOGGER_INFO, "multi-client video slot %d: backlog over cap, dropping to next keyframe", slot);
+        }
+        s->dropped_frames++;
+        g_mutex_unlock(&s->lock);
+        return;
+    }
+    if (was_dropping) {
+        logger_log(logger, LOGGER_INFO, "multi-client video slot %d: resumed at keyframe after dropping %u frames",
+                   slot, s->dropped_frames);
+        s->dropped_frames = 0;
     }
     GstBuffer *buffer = gst_buffer_new_allocate(NULL, data_len, NULL);
     g_assert(buffer != NULL);
