@@ -574,7 +574,7 @@ static void get_renderer_type(unsigned char *ct, int *id) {
     render_audio = FALSE;
     *id = -1;
     for (int i = 0; i < NFORMATS; i++) {
-        if (renderer_type[i]->ct == *ct) {
+        if (renderer_type[i] && renderer_type[i]->ct == *ct) {
 	    *id = i;
             break;
         }
@@ -714,15 +714,30 @@ void audio_renderer_flush() {
 void audio_renderer_destroy() {
     audio_renderer_stop();
     for (int i = 0; i < NFORMATS ; i++ ) {
-        gst_object_unref (renderer_type[i]->bus);
-        renderer_type[i]->bus = NULL;
-        gst_object_unref (renderer_type[i]->volume);
-        renderer_type[i]->volume = NULL;
-        gst_object_unref (renderer_type[i]->appsrc);
-        renderer_type[i]->appsrc = NULL;
-        gst_object_unref (renderer_type[i]->pipeline);
-        renderer_type[i]->pipeline = NULL;
+        /* In multi-client mode audio_renderer_init() is never called (each client gets its own pipeline from
+         * audio_renderer_multi_client_start), so there is nothing to tear down here. Dereferencing the NULL
+         * renderer_type[i] crashed uxplay with SIGSEGV on every shutdown, from cleanup(). */
+        if (!renderer_type[i]) {
+            continue;
+        }
+        if (renderer_type[i]->bus) {
+            gst_object_unref (renderer_type[i]->bus);
+            renderer_type[i]->bus = NULL;
+        }
+        if (renderer_type[i]->volume) {
+            gst_object_unref (renderer_type[i]->volume);
+            renderer_type[i]->volume = NULL;
+        }
+        if (renderer_type[i]->appsrc) {
+            gst_object_unref (renderer_type[i]->appsrc);
+            renderer_type[i]->appsrc = NULL;
+        }
+        if (renderer_type[i]->pipeline) {
+            gst_object_unref (renderer_type[i]->pipeline);
+            renderer_type[i]->pipeline = NULL;
+        }
         free(renderer_type[i]);
+        renderer_type[i] = NULL;
     }
 }
 
