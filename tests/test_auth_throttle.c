@@ -122,6 +122,42 @@ int main(void) {
     assert(auth_throttle_record_failure(&t, host_a, 0, now) == 0);
     assert(auth_throttle_record_failure(&t, host_a, 17, now) == 0);
 
+    /* keys: IPv4 by the full address, IPv6 by its /64, v4-mapped IPv6 as IPv4 */
+    {
+        unsigned char k1[AUTH_THROTTLE_KEY_MAX], k2[AUTH_THROTTLE_KEY_MAX];
+        const unsigned char a1[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 2, 0, 0, 0, 0, 0, 0, 0, 1};
+        const unsigned char a2[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 2, 0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4};
+        const unsigned char other64[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 3, 0, 0, 0, 0, 0, 0, 0, 1};
+        assert(auth_throttle_key(a1, 16, k1) == 8);
+        assert(auth_throttle_key(a2, 16, k2) == 8);
+        assert(memcmp(k1, k2, 8) == 0);                   /* same /64: one record */
+        assert(auth_throttle_key(other64, 16, k2) == 8);
+        assert(memcmp(k1, k2, 8) != 0);                   /* another /64: its own record */
+        const unsigned char mapped[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 1, 40};
+        assert(auth_throttle_key(mapped, 16, k1) == 4);
+        assert(memcmp(k1, host_a, 4) == 0);               /* ::ffff:192.168.1.40 is 192.168.1.40 */
+        assert(auth_throttle_key(host_a, 4, k1) == 4);
+        assert(auth_throttle_key(host_a, 5, k1) == 0);    /* neither IPv4 nor IPv6 */
+        assert(auth_throttle_key(NULL, 4, k1) == 0);
+
+        /* rotating addresses inside one /64 does not buy more free guesses */
+        auth_throttle_t t6;
+        memset(&t6, 0, sizeof t6);
+        unsigned char a[16];
+        memcpy(a, a1, 16);
+        int locked_at = -1;
+        for (int i = 0; i < 20; i++) {
+            a[15] = (unsigned char) i;                    /* a new address every time */
+            a[14] = (unsigned char) (i * 7);
+            int kl = auth_throttle_key(a, 16, k1);
+            if (auth_throttle_record_failure(&t6, k1, kl, now) > 0 && locked_at < 0) locked_at = i;
+        }
+        assert(locked_at == AUTH_THROTTLE_FREE_FAILURES); /* the 6th, not the 100th */
+        a[15] = 99;
+        int kl = auth_throttle_key(a, 16, k1);
+        assert(auth_throttle_is_locked(&t6, k1, kl, now));
+    }
+
     puts("auth_throttle: ok");
     return 0;
 }
