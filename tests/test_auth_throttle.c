@@ -136,6 +136,26 @@ int main(void) {
         const unsigned char mapped[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 168, 1, 40};
         assert(auth_throttle_key(mapped, 16, k1) == 4);
         assert(memcmp(k1, host_a, 4) == 0);               /* ::ffff:192.168.1.40 is 192.168.1.40 */
+        /* link-local (fe80::/10) is keyed by the full address, so one attacker on the
+         * link cannot throttle its neighbours */
+        const unsigned char ll1[16] = {0xfe, 0x80, 0, 0, 0, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8};
+        const unsigned char ll2[16] = {0xfe, 0x80, 0, 0, 0, 0, 0, 0, 9, 9, 9, 9, 9, 9, 9, 9};
+        const unsigned char ll_top[16] = {0xfe, 0xbf, 0xff, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1}; /* still fe80::/10 */
+        const unsigned char not_ll[16] = {0xfe, 0xc0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1};     /* fec0:: is not */
+        assert(auth_throttle_key(ll1, 16, k1) == 16);
+        assert(auth_throttle_key(ll2, 16, k2) == 16);
+        assert(memcmp(k1, k2, 16) != 0);
+        assert(auth_throttle_key(ll_top, 16, k1) == 16);
+        assert(auth_throttle_key(not_ll, 16, k1) == 8);
+        {
+            auth_throttle_t tl;
+            memset(&tl, 0, sizeof tl);
+            int k1l = auth_throttle_key(ll1, 16, k1);
+            int k2l = auth_throttle_key(ll2, 16, k2);
+            for (int i = 0; i <= AUTH_THROTTLE_FREE_FAILURES; i++) auth_throttle_record_failure(&tl, k1, k1l, now);
+            assert(auth_throttle_is_locked(&tl, k1, k1l, now));      /* the attacker */
+            assert(!auth_throttle_is_locked(&tl, k2, k2l, now));     /* a neighbour on the link */
+        }
         assert(auth_throttle_key(host_a, 4, k1) == 4);
         assert(auth_throttle_key(host_a, 5, k1) == 0);    /* neither IPv4 nor IPv6 */
         assert(auth_throttle_key(NULL, 4, k1) == 0);

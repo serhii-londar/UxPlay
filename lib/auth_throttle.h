@@ -10,13 +10,15 @@
  * AUTH_THROTTLE_MAX_LOCK. A correct attempt clears the address, and an address
  * that stays quiet for AUTH_THROTTLE_FORGET_AFTER seconds is forgotten.
  *
- * Addresses are keyed with auth_throttle_key(): IPv4 by the full address, IPv6 by
- * its /64 prefix. A host controls its whole /64 (and usually rotates privacy
- * addresses inside it), so keying IPv6 by the full address would give an
- * attacker 5 free guesses per address and make the limit meaningless. The cost
- * is that every IPv6 sender in one /64, including every fe80:: neighbour on a
- * link, shares one record: while someone guesses, the others on that prefix are
- * throttled too. IPv4-mapped IPv6 addresses count as the IPv4 address.
+ * Addresses are keyed with auth_throttle_key(): IPv4 by the full address, global
+ * and unique-local IPv6 by its /64 prefix, and link-local IPv6 (fe80::/10) by the
+ * full address. A host controls its whole /64 (and usually rotates privacy
+ * addresses inside it), so keying those by the full address would give an
+ * attacker 5 free guesses per address and make the limit meaningless. Every
+ * neighbour on a link shares the same fe80::/64 prefix, though, so keying
+ * link-local by /64 would let one attacker on the link throttle all the others:
+ * those stay per full address. IPv4-mapped IPv6 addresses count as the IPv4
+ * address.
  *
  * The table is bounded (AUTH_THROTTLE_SLOTS). A locked address is never evicted
  * to make room: otherwise an attacker rotating source addresses could push a
@@ -76,6 +78,10 @@ auth_throttle_key(const unsigned char *addr, int addrlen, unsigned char *key) {
         if (memcmp(addr, v4_mapped_prefix, 12) == 0) {
             memcpy(key, addr + 12, 4); /* ::ffff:a.b.c.d is the IPv4 address a.b.c.d */
             return 4;
+        }
+        if (addr[0] == 0xfe && (addr[1] & 0xc0) == 0x80) {
+            memcpy(key, addr, 16); /* link-local (fe80::/10): the full address */
+            return 16;
         }
         memcpy(key, addr, 8); /* the /64 */
         return 8;
