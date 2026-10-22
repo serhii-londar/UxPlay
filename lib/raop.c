@@ -162,12 +162,20 @@ raop_auth_now(void) {
 #endif
 }
 
+/* The throttle key for this connection's remote address (IPv4, or the IPv6
+ * /64). Returns its length, 0 when the address is unusable. */
+static int
+raop_auth_key(raop_conn_t *conn, unsigned char *key) {
+    return auth_throttle_key(conn->remote, conn->remotelen, key);
+}
+
 /* True while this connection's remote address is locked out after repeated
  * wrong PINs / passwords. Logs the refusal without naming the device. */
 static bool
 raop_auth_locked(raop_conn_t *conn) {
-    uint64_t now = raop_auth_now();
-    uint32_t left = auth_throttle_remaining(&conn->raop->auth_throttle, conn->remote, conn->remotelen, now);
+    unsigned char key[AUTH_THROTTLE_KEY_MAX];
+    int keylen = raop_auth_key(conn, key);
+    uint32_t left = auth_throttle_remaining(&conn->raop->auth_throttle, key, keylen, raop_auth_now());
     if (left > 0) {
         logger_log(conn->raop->logger, LOGGER_WARNING,
                    "authentication refused: too many wrong PIN/password attempts from this address, %u s left", left);
@@ -177,8 +185,9 @@ raop_auth_locked(raop_conn_t *conn) {
 
 static void
 raop_auth_failed(raop_conn_t *conn) {
-    uint32_t lock = auth_throttle_record_failure(&conn->raop->auth_throttle, conn->remote, conn->remotelen,
-                                                 raop_auth_now());
+    unsigned char key[AUTH_THROTTLE_KEY_MAX];
+    int keylen = raop_auth_key(conn, key);
+    uint32_t lock = auth_throttle_record_failure(&conn->raop->auth_throttle, key, keylen, raop_auth_now());
     if (lock > 0) {
         logger_log(conn->raop->logger, LOGGER_WARNING,
                    "too many wrong PIN/password attempts from one address: locked out for %u s", lock);
@@ -187,7 +196,9 @@ raop_auth_failed(raop_conn_t *conn) {
 
 static void
 raop_auth_succeeded(raop_conn_t *conn) {
-    auth_throttle_record_success(&conn->raop->auth_throttle, conn->remote, conn->remotelen);
+    unsigned char key[AUTH_THROTTLE_KEY_MAX];
+    int keylen = raop_auth_key(conn, key);
+    auth_throttle_record_success(&conn->raop->auth_throttle, key, keylen);
 }
 
 #include "raop_handlers.h"

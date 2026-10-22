@@ -10,6 +10,16 @@
  * AUTH_THROTTLE_MAX_LOCK. A correct attempt clears the address, and an address
  * that stays quiet for AUTH_THROTTLE_FORGET_AFTER seconds is forgotten.
  *
+ * Addresses are keyed with auth_throttle_key(): IPv4 by the full address, global
+ * and unique-local IPv6 by its /64 prefix, and link-local IPv6 (fe80::/10) by the
+ * full address. A host controls its whole /64 (and usually rotates privacy
+ * addresses inside it), so keying those by the full address would give an
+ * attacker 5 free guesses per address and make the limit meaningless. Every
+ * neighbour on a link shares the same fe80::/64 prefix, though, so keying
+ * link-local by /64 would let one attacker on the link throttle all the others:
+ * those stay per full address. IPv4-mapped IPv6 addresses count as the IPv4
+ * address.
+ *
  * The table is bounded (AUTH_THROTTLE_SLOTS). A locked address is never evicted
  * to make room: otherwise an attacker rotating source addresses could push a
  * locked address out and reset it. When every slot holds a locked address and a
@@ -52,6 +62,32 @@ typedef struct {
      * addresses are refused too (see auth_throttle_is_locked). */
     uint64_t saturated_until;
 } auth_throttle_t;
+
+/* The table key for a raw address of [addrlen] bytes (4 = IPv4, 16 = IPv6).
+ * Writes at most AUTH_THROTTLE_KEY_MAX bytes to [key] and returns the key
+ * length, or 0 for an address that is neither. */
+static inline int
+auth_throttle_key(const unsigned char *addr, int addrlen, unsigned char *key) {
+    if (!addr || !key) return 0;
+    if (addrlen == 4) {
+        memcpy(key, addr, 4);
+        return 4;
+    }
+    if (addrlen == 16) {
+        static const unsigned char v4_mapped_prefix[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff};
+        if (memcmp(addr, v4_mapped_prefix, 12) == 0) {
+            memcpy(key, addr + 12, 4); /* ::ffff:a.b.c.d is the IPv4 address a.b.c.d */
+            return 4;
+        }
+        if (addr[0] == 0xfe && (addr[1] & 0xc0) == 0x80) {
+            memcpy(key, addr, 16); /* link-local (fe80::/10): the full address */
+            return 16;
+        }
+        memcpy(key, addr, 8); /* the /64 */
+        return 8;
+    }
+    return 0;
+}
 
 static inline auth_throttle_entry_t *
 auth_throttle_find(auth_throttle_t *t, const unsigned char *key, int keylen) {
