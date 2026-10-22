@@ -292,6 +292,11 @@ raop_handler_pairpinstart(raop_conn_t *conn,
                           char **response_data, int *response_datalen) {
     raop_t *raop = conn->raop;
     logger_log(raop->logger, LOGGER_INFO, "client sent PAIR-PIN-START request");
+    if (raop_auth_locked(conn)) {
+        /* No PIN on screen for an address that is being throttled. */
+        http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
+        return;
+    }
     int pin_4 = 0;
     if (raop->pin > 9999) {
         /* fixed pin configured via "-pin NNNN": shared config, same for every client */
@@ -326,6 +331,11 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
     bool logger_debug = (logger_get_level(raop->logger) >= LOGGER_DEBUG);
     request_data = http_request_get_data(request, &request_datalen);
     logger_log(raop->logger, LOGGER_INFO, "client requested pair-setup-pin, datalen = %d", request_datalen);
+    if (raop_auth_locked(conn)) {
+        /* Refused outright: not counted as a further failure. */
+        http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
+        return;
+    }
     if (request_datalen > 0) {
         char *header_str= NULL; 
         http_request_get_header_string(request, &header_str);
@@ -461,6 +471,7 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
             goto authentication_failed;
         } else {
             logger_log(raop->logger, LOGGER_DEBUG, "pair-pin-setup success\n");
+            raop_auth_succeeded(conn);
         }
         pairing_session_set_setup_status(conn->session);
         if (raop->callbacks.register_client) {
@@ -483,6 +494,7 @@ raop_handler_pairsetup_pin(raop_conn_t *conn,
         return;
     }
  authentication_failed:;
+    raop_auth_failed(conn);
     http_response_init(response, "RTSP/1.0", 470, "Client Authentication Failure");
 }
 
@@ -754,7 +766,8 @@ raop_handler_setup(raop_conn_t *conn,
                 }
                 raop->auth_fail_count = 0;
             }
-            if (len == -1 && !authorization && raop->random_pw) {
+            bool auth_locked = !conn->authenticated && raop_auth_locked(conn);
+            if (len == -1 && !authorization && raop->random_pw && !auth_locked) {
                 if (raop->callbacks.display_pin) {
                     raop->callbacks.display_pin(raop->callbacks.cls, raop->random_pw);
                 }
@@ -771,7 +784,15 @@ raop_handler_setup(raop_conn_t *conn,
                     const char *ptr = strstr(authorization, "nonce=\"") +  strlen("nonce=\"");
                     strncpy(nonce_string, ptr, 32);
                     const char *method = http_request_get_method(request);
-                    conn->authenticated = pairing_digest_verify(method, authorization, password);
+                    /* While the address is locked out the answer is not even checked. */
+                    conn->authenticated = !auth_locked && pairing_digest_verify(method, authorization, password);
+                    if (!auth_locked) {
+                        if (conn->authenticated) {
+                            raop_auth_succeeded(conn);
+                        } else {
+                            raop_auth_failed(conn);
+                        }
+                    }
 		    if (!conn->authenticated) {
                         // if random_pw is used, the auth_fail_count will be the number of times it is displayed after creation
                         if (len != -1) {

@@ -31,6 +31,8 @@
 #include "compat.h"
 #include "raop_rtp_mirror.h"
 #include "raop_ntp.h"
+#include "auth_throttle.h"
+#include <time.h>
 
 
 /* libplist-2.3.0  API change */
@@ -101,6 +103,11 @@ struct raop_s {
     char *random_pw;
     unsigned char auth_fail_count;
 
+    /* Back-off for wrong PIN / password attempts, per remote address. A zeroed
+     * table is empty, which is what calloc gives raop_init(). Only the httpd
+     * thread touches it. */
+    auth_throttle_t auth_throttle;
+
     /* used for setting HLS video language choices */
     const char *lang;
     const char *lang_system;
@@ -142,6 +149,46 @@ struct raop_conn_s {
     unsigned short pending_pin;
 };
 typedef struct raop_conn_s raop_conn_t;
+
+/* Seconds on a monotonic clock, for auth_throttle. */
+static uint64_t
+raop_auth_now(void) {
+#ifdef _WIN32
+    return (uint64_t) (GetTickCount64() / 1000);
+#else
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
+    return (uint64_t) ts.tv_sec;
+#endif
+}
+
+/* True while this connection's remote address is locked out after repeated
+ * wrong PINs / passwords. Logs the refusal without naming the device. */
+static bool
+raop_auth_locked(raop_conn_t *conn) {
+    uint64_t now = raop_auth_now();
+    uint32_t left = auth_throttle_remaining(&conn->raop->auth_throttle, conn->remote, conn->remotelen, now);
+    if (left > 0) {
+        logger_log(conn->raop->logger, LOGGER_WARNING,
+                   "authentication refused: too many wrong PIN/password attempts from this address, %u s left", left);
+    }
+    return left > 0;
+}
+
+static void
+raop_auth_failed(raop_conn_t *conn) {
+    uint32_t lock = auth_throttle_record_failure(&conn->raop->auth_throttle, conn->remote, conn->remotelen,
+                                                 raop_auth_now());
+    if (lock > 0) {
+        logger_log(conn->raop->logger, LOGGER_WARNING,
+                   "too many wrong PIN/password attempts from one address: locked out for %u s", lock);
+    }
+}
+
+static void
+raop_auth_succeeded(raop_conn_t *conn) {
+    auth_throttle_record_success(&conn->raop->auth_throttle, conn->remote, conn->remotelen);
+}
 
 #include "raop_handlers.h"
 #include "http_handlers.h"

@@ -1,0 +1,120 @@
+/*
+ * Per-address back-off for wrong AirPlay PIN / password attempts.
+ *
+ * A 4-digit PIN has 10,000 values. Without a limit a sender on the LAN can walk
+ * all of them in minutes, because the SRP / digest check runs here and nothing
+ * in front of it slows repeated pairing attempts. This table makes the walk take
+ * days: the first AUTH_THROTTLE_FREE_FAILURES wrong attempts from an address cost
+ * nothing, the next one locks that address out for AUTH_THROTTLE_BASE_LOCK
+ * seconds, and every further wrong attempt doubles the lockout up to
+ * AUTH_THROTTLE_MAX_LOCK. A correct attempt clears the address, and an address
+ * that stays quiet for AUTH_THROTTLE_FORGET_AFTER seconds is forgotten.
+ *
+ * Header-only, no allocation and no dependencies, so it can be unit-tested on
+ * its own (tests/test_auth_throttle.c). The caller supplies the time in seconds
+ * (any monotonic clock), which keeps the tests deterministic. A zeroed
+ * auth_throttle_t (calloc) is a valid empty table. Not thread-safe: the RAOP
+ * handlers that use it all run on the single httpd thread.
+ */
+#ifndef AUTH_THROTTLE_H
+#define AUTH_THROTTLE_H
+
+#include <stdbool.h>
+#include <stdint.h>
+#include <string.h>
+
+#define AUTH_THROTTLE_FREE_FAILURES 5
+#define AUTH_THROTTLE_BASE_LOCK 30u
+#define AUTH_THROTTLE_MAX_LOCK 600u
+#define AUTH_THROTTLE_FORGET_AFTER 3600u
+#define AUTH_THROTTLE_SLOTS 64
+#define AUTH_THROTTLE_KEY_MAX 16 /* an IPv6 address; IPv4 uses the first 4 bytes */
+
+typedef struct {
+    bool used;
+    unsigned char key[AUTH_THROTTLE_KEY_MAX];
+    int keylen;
+    unsigned int failures;
+    uint64_t last_failure;
+    uint64_t locked_until;
+} auth_throttle_entry_t;
+
+typedef struct {
+    auth_throttle_entry_t entries[AUTH_THROTTLE_SLOTS];
+} auth_throttle_t;
+
+static inline auth_throttle_entry_t *
+auth_throttle_find(auth_throttle_t *t, const unsigned char *key, int keylen) {
+    if (!t || !key || keylen <= 0 || keylen > AUTH_THROTTLE_KEY_MAX) return NULL;
+    for (int i = 0; i < AUTH_THROTTLE_SLOTS; i++) {
+        auth_throttle_entry_t *e = &t->entries[i];
+        if (e->used && e->keylen == keylen && memcmp(e->key, key, (size_t) keylen) == 0) return e;
+    }
+    return NULL;
+}
+
+/* Drops [e] when it has been quiet for AUTH_THROTTLE_FORGET_AFTER; returns it otherwise. */
+static inline auth_throttle_entry_t *
+auth_throttle_live(auth_throttle_entry_t *e, uint64_t now) {
+    if (e && now > e->last_failure && now - e->last_failure > AUTH_THROTTLE_FORGET_AFTER) {
+        memset(e, 0, sizeof(*e));
+        return NULL;
+    }
+    return e;
+}
+
+/* Seconds left on the lockout for this address; 0 when it may try. */
+static inline uint32_t
+auth_throttle_remaining(auth_throttle_t *t, const unsigned char *key, int keylen, uint64_t now) {
+    auth_throttle_entry_t *e = auth_throttle_live(auth_throttle_find(t, key, keylen), now);
+    if (!e || e->locked_until <= now) return 0;
+    return (uint32_t) (e->locked_until - now);
+}
+
+static inline bool
+auth_throttle_is_locked(auth_throttle_t *t, const unsigned char *key, int keylen, uint64_t now) {
+    return auth_throttle_remaining(t, key, keylen, now) > 0;
+}
+
+/* Records a wrong attempt; returns the lockout it caused, in seconds (0 = none yet). */
+static inline uint32_t
+auth_throttle_record_failure(auth_throttle_t *t, const unsigned char *key, int keylen, uint64_t now) {
+    if (!t || !key || keylen <= 0 || keylen > AUTH_THROTTLE_KEY_MAX) return 0;
+    auth_throttle_entry_t *e = auth_throttle_live(auth_throttle_find(t, key, keylen), now);
+    if (!e) {
+        /* A free slot, else the one whose last failure is oldest. */
+        auth_throttle_entry_t *oldest = &t->entries[0];
+        for (int i = 0; i < AUTH_THROTTLE_SLOTS; i++) {
+            auth_throttle_entry_t *c = &t->entries[i];
+            if (!c->used) { oldest = c; break; }
+            if (c->last_failure < oldest->last_failure) oldest = c;
+        }
+        e = oldest;
+        memset(e, 0, sizeof(*e));
+        e->used = true;
+        memcpy(e->key, key, (size_t) keylen);
+        e->keylen = keylen;
+    }
+    if (e->failures < 0xFFFFu) e->failures++;
+    e->last_failure = now;
+    if (e->failures <= AUTH_THROTTLE_FREE_FAILURES) return 0;
+
+    unsigned int over = e->failures - AUTH_THROTTLE_FREE_FAILURES - 1; /* 0 for the first lockout */
+    uint64_t lock = AUTH_THROTTLE_BASE_LOCK;
+    while (over > 0 && lock < AUTH_THROTTLE_MAX_LOCK) {
+        lock *= 2;
+        over--;
+    }
+    if (lock > AUTH_THROTTLE_MAX_LOCK) lock = AUTH_THROTTLE_MAX_LOCK;
+    e->locked_until = now + lock;
+    return (uint32_t) lock;
+}
+
+/* A correct attempt clears the address. */
+static inline void
+auth_throttle_record_success(auth_throttle_t *t, const unsigned char *key, int keylen) {
+    auth_throttle_entry_t *e = auth_throttle_find(t, key, keylen);
+    if (e) memset(e, 0, sizeof(*e));
+}
+
+#endif /* AUTH_THROTTLE_H */
