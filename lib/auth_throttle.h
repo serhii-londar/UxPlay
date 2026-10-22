@@ -10,6 +10,13 @@
  * AUTH_THROTTLE_MAX_LOCK. A correct attempt clears the address, and an address
  * that stays quiet for AUTH_THROTTLE_FORGET_AFTER seconds is forgotten.
  *
+ * The table is bounded (AUTH_THROTTLE_SLOTS). A locked address is never evicted
+ * to make room: otherwise an attacker rotating source addresses could push a
+ * locked address out and reset it. When every slot holds a locked address and a
+ * new address fails, the table is saturated: addresses it does not know are
+ * refused until the earliest lockout expires, so the walk cannot be sped up by
+ * using more addresses than the table has slots.
+ *
  * Header-only, no allocation and no dependencies, so it can be unit-tested on
  * its own (tests/test_auth_throttle.c). The caller supplies the time in seconds
  * (any monotonic clock), which keeps the tests deterministic. A zeroed
@@ -41,6 +48,9 @@ typedef struct {
 
 typedef struct {
     auth_throttle_entry_t entries[AUTH_THROTTLE_SLOTS];
+    /* While now < saturated_until every slot is a live lockout: unknown
+     * addresses are refused too (see auth_throttle_is_locked). */
+    uint64_t saturated_until;
 } auth_throttle_t;
 
 static inline auth_throttle_entry_t *
@@ -66,8 +76,13 @@ auth_throttle_live(auth_throttle_entry_t *e, uint64_t now) {
 /* Seconds left on the lockout for this address; 0 when it may try. */
 static inline uint32_t
 auth_throttle_remaining(auth_throttle_t *t, const unsigned char *key, int keylen, uint64_t now) {
+    if (!t || !key || keylen <= 0 || keylen > AUTH_THROTTLE_KEY_MAX) return 0;
     auth_throttle_entry_t *e = auth_throttle_live(auth_throttle_find(t, key, keylen), now);
-    if (!e || e->locked_until <= now) return 0;
+    if (!e) {
+        /* Unknown address: refused only while every slot is a live lockout. */
+        return (t->saturated_until > now) ? (uint32_t) (t->saturated_until - now) : 0;
+    }
+    if (e->locked_until <= now) return 0;
     return (uint32_t) (e->locked_until - now);
 }
 
@@ -82,14 +97,26 @@ auth_throttle_record_failure(auth_throttle_t *t, const unsigned char *key, int k
     if (!t || !key || keylen <= 0 || keylen > AUTH_THROTTLE_KEY_MAX) return 0;
     auth_throttle_entry_t *e = auth_throttle_live(auth_throttle_find(t, key, keylen), now);
     if (!e) {
-        /* A free slot, else the one whose last failure is oldest. */
-        auth_throttle_entry_t *oldest = &t->entries[0];
+        /* A free slot, else the quiet unlocked entry whose last failure is
+         * oldest. A locked address is never evicted. */
+        auth_throttle_entry_t *victim = NULL;
+        uint64_t earliest_unlock = 0;
         for (int i = 0; i < AUTH_THROTTLE_SLOTS; i++) {
             auth_throttle_entry_t *c = &t->entries[i];
-            if (!c->used) { oldest = c; break; }
-            if (c->last_failure < oldest->last_failure) oldest = c;
+            if (!c->used) { victim = c; break; }
+            if (c->locked_until > now) {
+                if (earliest_unlock == 0 || c->locked_until < earliest_unlock) earliest_unlock = c->locked_until;
+                continue;
+            }
+            if (!victim || c->last_failure < victim->last_failure) victim = c;
         }
-        e = oldest;
+        if (!victim) {
+            /* Every slot is a live lockout: this address cannot be tracked, so
+             * refuse unknown addresses until the earliest lockout ends. */
+            t->saturated_until = earliest_unlock;
+            return (uint32_t) (earliest_unlock - now);
+        }
+        e = victim;
         memset(e, 0, sizeof(*e));
         e->used = true;
         memcpy(e->key, key, (size_t) keylen);

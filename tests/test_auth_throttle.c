@@ -75,12 +75,46 @@ int main(void) {
     memset(&full, 0, sizeof full);
     for (int i = 0; i < 4 * AUTH_THROTTLE_SLOTS; i++) {
         unsigned char key[4] = {10, 0, (unsigned char) (i / 256), (unsigned char) (i % 256)};
-        for (int j = 0; j <= AUTH_THROTTLE_FREE_FAILURES; j++) {
+        /* quiet failures: not enough to lock, so they can be evicted */
+        for (int j = 0; j < AUTH_THROTTLE_FREE_FAILURES; j++) {
             auth_throttle_record_failure(&full, key, 4, now + (uint64_t) i);
         }
     }
     unsigned char recent[4] = {10, 0, 0, (unsigned char) (4 * AUTH_THROTTLE_SLOTS - 1)};
+    for (int j = 0; j <= 1; j++) auth_throttle_record_failure(&full, recent, 4, now + 4 * AUTH_THROTTLE_SLOTS);
     assert(auth_throttle_is_locked(&full, recent, 4, now + 4 * AUTH_THROTTLE_SLOTS));
+
+    /* a locked address is never evicted to make room (rotating source addresses
+     * must not reset it) */
+    auth_throttle_t ev;
+    memset(&ev, 0, sizeof ev);
+    unsigned char locked[4] = {172, 16, 0, 1};
+    for (int j = 0; j <= AUTH_THROTTLE_FREE_FAILURES; j++) auth_throttle_record_failure(&ev, locked, 4, now);
+    assert(auth_throttle_is_locked(&ev, locked, 4, now));
+    for (int i = 0; i < 10 * AUTH_THROTTLE_SLOTS; i++) {
+        unsigned char key[4] = {10, 1, (unsigned char) (i / 256), (unsigned char) (i % 256)};
+        auth_throttle_record_failure(&ev, key, 4, now + 1);
+    }
+    assert(auth_throttle_is_locked(&ev, locked, 4, now + 1));
+    assert(auth_throttle_remaining(&ev, locked, 4, now + 1) == AUTH_THROTTLE_BASE_LOCK - 1);
+
+    /* when every slot is a live lockout, unknown addresses are refused until the
+     * earliest one ends, so more addresses than slots do not speed the guessing up */
+    auth_throttle_t sat;
+    memset(&sat, 0, sizeof sat);
+    for (int i = 0; i < AUTH_THROTTLE_SLOTS; i++) {
+        unsigned char key[4] = {10, 2, 0, (unsigned char) i};
+        for (int j = 0; j <= AUTH_THROTTLE_FREE_FAILURES; j++) auth_throttle_record_failure(&sat, key, 4, now);
+    }
+    unsigned char fresh[4] = {10, 3, 0, 1};
+    assert(!auth_throttle_is_locked(&sat, fresh, 4, now));
+    assert(auth_throttle_record_failure(&sat, fresh, 4, now) > 0); /* cannot be tracked: refused */
+    assert(auth_throttle_is_locked(&sat, fresh, 4, now));
+    assert(auth_throttle_remaining(&sat, fresh, 4, now) == AUTH_THROTTLE_BASE_LOCK);
+    /* ... and is let through again once those lockouts have ended */
+    assert(!auth_throttle_is_locked(&sat, fresh, 4, now + AUTH_THROTTLE_BASE_LOCK + 1));
+    unsigned char first_locked[4] = {10, 2, 0, 0};
+    assert(!auth_throttle_is_locked(&sat, first_locked, 4, now + AUTH_THROTTLE_BASE_LOCK + 1));
 
     /* bad input is ignored, not crashed on */
     assert(!auth_throttle_is_locked(NULL, host_a, 4, now));
